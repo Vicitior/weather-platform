@@ -251,20 +251,34 @@ db_mirror/
 └── _mirror_manifest.json          # 行数校验、抓取时间
 ```
 
-**每个 parquet 的字段**：
+**parquet 里存的字段**（原始镜像，未做任何修正）：
 
-| 字段 | 说明 |
-|---|---|
-| `ts` | UTC 时间戳 |
-| `ts_bj` | 北京时间 |
-| `date_true` | **修正后的真实日期**（已减 100 年 + 闰日修正） |
-| `avg_temperature` | 平均气温 ℃ |
-| `max_temperature` | 最高气温 ℃ |
-| `min_temperature` | 最低气温 ℃ |
-| `avg_humidity` | 相对湿度 % |
-| `precipitation` | 降水量 mm |
-| `avg_wind_speed` | 平均风速 m/s |
-| `sunshine_hours` | 日照时数 h |
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `ts` | timestamp tz | UTC 时间戳 |
+| `ts_bj` | timestamp | 北京时间 —— **注意仍是源库的 +100 年值**（2051–2125） |
+| `avg_temperature` | double | 平均气温 ℃ |
+| `max_temperature` | double | 最高气温 ℃ |
+| `min_temperature` | double | 最低气温 ℃ |
+| `avg_humidity` | bigint | 相对湿度 % |
+| `precipitation` | double | 降水量 mm |
+| `avg_wind_speed` | double | 平均风速 m/s |
+| `sunshine_hours` | double | 日照时数 h |
+| `file_path` / `user_id` / `user_nickname` | | 源库的溯源信息 |
+
+**时间修正由 `data.py` 的 duckdb 视图完成**，不在 parquet 里：
+
+```sql
+date_true = CAST(CAST(ts_bj AS DATE) - INTERVAL 100 YEAR AS DATE)
+          + (CASE WHEN hour(ts_bj) = 12 THEN 1 ELSE 0 END)
+```
+
+- `- 100 YEAR`：修正源库整体 +100 年的偏移（2051–2125 → 1951–2025）
+- `+ 1 天`（仅 12:00 那批）：修正闰日错位 —— 2100 不是闰年，`2000-02-29` 被挤到了
+  `2100-02-28`，并留下 12:00 的时间相位，全库 684 站在这一天都有两行
+
+所以**如果你不用本项目的 API、要自己读 parquet，记得自己减 100 年并处理 12:00 相位**。
+用 `weather_api` 的话这些都已经在视图里做好了（`weather` / `weather_hist` / `weather_ok` / `weather_hist_ok`）。
 
 ---
 
