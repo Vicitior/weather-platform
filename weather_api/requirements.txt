@@ -1,0 +1,17 @@
+# 气象数据查询 API —— 运行依赖
+# 安装：pip install -r requirements.txt
+# 实测环境：Python 3.13.5 / Windows Server
+
+fastapi==0.136.1
+uvicorn==0.46.0
+pydantic==2.11.7
+
+# 数据层（读取本地 parquet 镜像）
+duckdb==2.0.0
+pandas==3.0.2
+pyarrow==24.0.0
+numpy==2.4.3
+
+# 填报表导出（/api/report/export）
+python-docx==1.2.0
+openpyxl==3.1.5
