@@ -3,8 +3,9 @@
 把一套**气象站点时序数据**（876 站 × 1951–2025 逐日 × 7 个要素，约 1700 万行）从云端数据库
 镜像到本地、做质量体检、识别并修复异常/缺测，并对外提供一套完整的中文气象查询 HTTP API。
 
-> 数据来源为第三方云数据库（TDengine Cloud + MySQL RDS）。本仓库**不含任何数据、不含任何凭据**，
-> 只包含代码。数据请用 `mirror_dbs.py` 从你自己的库镜像。
+> 数据来源为第三方云数据库（TDengine Cloud + MySQL RDS）。本仓库的 git 历史里**不含数据、不含任何凭据**。
+> 想立刻跑起来：直接下 [Release 里的数据包](https://github.com/Vicitior/weather-platform/releases)（367 MB，
+> 解压即用）；想自己从源库镜像：用 `mirror_dbs.py`。
 
 ---
 
@@ -281,7 +282,7 @@ systemd/NSSM 守护 → 放行端口 → Nginx HTTPS。
 - **只读**：API 不改任何数据，所有查询走本地 parquet
 - **无鉴权**：上线前请自己在 Nginx 层加 Basic Auth / 限流
 - **单机**：duckdb 直接扫 parquet，没有分布式；876 站规模下 overview 约 1.4 s，其余接口多在 100 ms 内
-- **数据不自带**：仓库只有代码。请用 `mirror_dbs.py` 从你自己的库拉
+- **数据不在 git 里**：`db_mirror/` 有 392 MB，放在 Release 附件（367 MB 压缩包）。`git clone` 只得到代码
 - **降水不适用跨要素回归/克里金**：这是实测结论，不是没实现
 
 ---
