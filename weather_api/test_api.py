@@ -445,5 +445,67 @@ try:
 except ValueError:
     check("不存在站点报错", True, "")
 
+print("== 28. v0.12 判据升级：温度自洽性 / 滚动基线 / 列互换 ==")
+# 28.1 温度三列内部一致性：物理约束 min <= avg <= max
+check("_temp_consistency 可用", callable(getattr(D, "_temp_consistency", None)), "")
+check("max<min 被识别", "max<min" in D._temp_consistency(
+    {"max_temperature": 5.0, "avg_temperature": 7.0, "min_temperature": 9.0}), "")
+check("avg<min 被识别（旧版漏检的核心）", "avg<min" in D._temp_consistency(
+    {"max_temperature": 16.1, "avg_temperature": 4.7, "min_temperature": 5.9}), "")
+check("max<avg 被识别", "max<avg" in D._temp_consistency(
+    {"max_temperature": 3.0, "avg_temperature": 8.0, "min_temperature": 1.0}), "")
+check("正常三列不报", D._temp_consistency(
+    {"max_temperature": 16.1, "avg_temperature": 9.0, "min_temperature": 2.5}) == [], "")
+# 28.2 repair_scan 现在能抓到 avg<min（1610 站列互换的 250 行）
+sc1610 = D.repair_scan(1610, year=2019)
+check("1610 站 avg<min 被检出（>200 行）", sc1610["summary"]["inconsistent_avgmin"] > 200,
+      sc1610["summary"]["inconsistent_avgmin"])
+check("1610 站 bad_rows 覆盖这些行", len(sc1610["bad_rows"]) >= 200, len(sc1610["bad_rows"]))
+check("summary 新增三项自洽性计数", all(k in sc1610["summary"] for k in
+      ("inconsistent_maxmin", "inconsistent_maxavg", "inconsistent_avgmin", "inconsistent_total")),
+      list(sc1610["summary"]))
+# 正常站不应有大量自洽性错误
+sc1382 = D.repair_scan(1382, year=2019)
+check("新乡站无大量自洽性错误（<50）", sc1382["summary"]["inconsistent_total"] < 50,
+      sc1382["summary"]["inconsistent_total"])
+# 28.3 日照天文上限判据
+check("_daylength 可用", abs(D._daylength(52.97, 172) - 16.68) < 0.5, D._daylength(52.97, 172))
+check("赤道春分约 12h", abs(D._daylength(0.0, 81) - 12.0) < 0.6, D._daylength(0.0, 81))
+check("高纬冬季日照短", D._daylength(52.97, 355) < 9.0, D._daylength(52.97, 355))
+# 28.4 PHYS_STRICT 更紧的合理性边界
+check("PHYS_STRICT 存在且更严", all(D.PHYS_STRICT[m][0] >= D.PHYS_RANGE[m][0]
+                                  and D.PHYS_STRICT[m][1] <= D.PHYS_RANGE[m][1] for m in D.PHYS_RANGE),
+      "")
+# 28.5 滚动基线 vs 固定基线
+hs_roll = D.hidden_scan(1382, start="1951-01-01", end="2025-12-31", baseline="rolling", detail_limit=3000)
+hs_fix = D.hidden_scan(1382, start="1951-01-01", end="2025-12-31", baseline="fixed", detail_limit=3000)
+check("baseline 字段回显", "rolling" in str(hs_roll.get("baseline")), hs_roll.get("baseline"))
+check("滚动基线 record 命中显著少于固定", hs_roll["summary"]["by_rule"]["record"] <
+      hs_fix["summary"]["by_rule"]["record"],
+      "%d < %d" % (hs_roll["summary"]["by_rule"]["record"], hs_fix["summary"]["by_rule"]["record"]))
+check("滚动基线 1960 年代误报大减", sum(1 for s in hs_roll["suspects"]
+                                        if s["date"][:4] >= "1960" and s["date"][:4] < "1970") <
+      sum(1 for s in hs_fix["suspects"] if s["date"][:4] >= "1960" and s["date"][:4] < "1970"), "")
+check("非法 baseline 报错", True, "")
+try:
+    D.hidden_scan(1382, year=2000, baseline="bogus")
+    check("非法 baseline 被拒", False, "")
+except ValueError:
+    check("非法 baseline 被拒", True, "")
+# 28.6 列互换检测
+cs = D.column_swap_scan(station_id=1610)
+check("1610 站被判定为列互换", cs["summary"]["found"] == 1, cs["summary"])
+if cs["stations"]:
+    c0 = cs["stations"][0]
+    check("互换对是 气温/风速", sorted(c0["swap_pair"]) == ["avg_temperature", "avg_wind_speed"], c0["swap_pair"])
+    check("分界点在 2013-10", str(c0["breakpoint"]).startswith("2013-10"), c0["breakpoint"])
+    check("对调后矛盾消除率 >95%", c0["fixed_ratio"] > 0.95, c0["fixed_ratio"])
+    check("互换后 a 列均值骤降（≈2.5 而非常年 12.4）",
+          c0["before_after"]["after"]["mean_a"] < 5 and c0["before_after"]["before"]["mean_a"] > 10,
+          (c0["before_after"]["before"]["mean_a"], c0["before_after"]["after"]["mean_a"]))
+    check("advice 说明要对调而非插值", "对调" in c0["advice"], c0["advice"][:40])
+cs2 = D.column_swap_scan(station_id=1382)
+check("正常站不被误判为列互换", cs2["summary"]["found"] == 0, cs2["summary"])
+
 print("\n===== %d passed, %d failed =====" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

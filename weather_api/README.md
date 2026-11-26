@@ -58,8 +58,9 @@ python -m weather_api.main --port 9000
 | GET | `/api/debug/values_above` | 超阈值记录追查（数据质量排查用） |
 | GET | `/api/report/table` | **气象数据填报表**（站点×12 月模板口径聚合 + 模板校验规则自动核查） |
 | GET | `/api/report/export` | **填报表导出**成 Word(.docx)/Excel(.xlsx) 成品文件（exports/ 目录） |
-| GET | `/api/repair/scan` | **缺测/异常扫描**：哨兵值（999999/32766）、超物理范围、max<min、缺行 |
-| GET | `/api/repair/hidden_scan` | **隐性异常扫描**：物理范围内但可疑（超本站该月历史极值 / 与同日邻站显著偏离），**只报不修**，附判断依据与邻站实测值 |
+| GET | `/api/repair/scan` | **缺测/异常扫描**：哨兵值（999999/32766）、物理范围、温度三列自洽性（min≤avg≤max）、日照超天文上限、缺行 |
+| GET | `/api/repair/hidden_scan` | **隐性异常扫描**：物理范围内但可疑（超本站该月历史极值[滚动±15年] / 与同日邻站显著偏离 / 超严格边界），**只报不修**，附判断依据与邻站实测值 |
+| GET | `/api/repair/column_swap` | **整列互换检测**：识别「两列数值被整体对调」（如 1610 站 2013-10 起气温/风速互换），给出分界日与对调后统计，修复方式是**对调不是插值** |
 | GET | `/api/repair/daily` | **异常值修复**：按坐标找最近 k 个邻站，用气候距平法重建（非简单复制最近站），空间法失效自动降级时间维 |
 | GET | `/api/repair/batches` | **录入批次列表**（按上传时间戳倒序，用于发现最新一批新数据） |
 | GET | `/api/repair/batch` | **批量补齐**：多站 × 一个区间一次跑完并汇总（`station_ids` 或 `province`） |
@@ -249,7 +250,7 @@ curl "http://127.0.0.1:8900/api/repair/daily?station_id=1124&date=2020-07-03&met
 weather_api/
 ├─ data.py       查询层：纯函数，不依赖 HTTP。网站后端可直接 import
 ├─ main.py       FastAPI 路由层：参数校验 → 调 data.py → JSON
-├─ test_api.py   169 项自检（python weather_api/test_api.py）
+├─ test_api.py   194 项自检（python weather_api/test_api.py）
 └─ README.md     本文档
 ```
 

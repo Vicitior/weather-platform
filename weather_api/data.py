@@ -779,6 +779,23 @@ PHYS_RANGE = {
     "avg_wind_speed": (0.0, 200.0),
     "sunshine_hours": (0.0, 24.0),
 }
+
+# 判据「合理性边界」——只用于异常检测时判定「数值可信度」，不参与 weather_ok 视图过滤。
+# 依据：全库 1696 万行剔除旧边界外的值后，真实极值为
+#   平均气温 [-46.7, 50.0]、最高气温 [-40.3, 53.0]、最低气温 [-60.0, 39.2]、
+#   降水 [0, 298.8]、风速 [0, 40.0]、日照 [0, 22.8]（见 _tmp_range_impact.py）。
+# 这里留出安全余量（气温 ±5~6℃、降水 1100mm/日 已是世界纪录量级、风速 60m/s）。
+# 注意：把 PHYS_RANGE 直接收窄到这些值几乎无收益（全库只多判 9 行无效），
+# 所以保留 PHYS_RANGE 不动以免改变既有统计口径，另设 PHYS_STRICT 供检测使用。
+PHYS_STRICT = {
+    "avg_temperature": (-60.0, 55.0),
+    "max_temperature": (-55.0, 55.0),
+    "min_temperature": (-65.0, 45.0),
+    "avg_humidity": (0.0, 100.0),
+    "precipitation": (0.0, 1000.0),
+    "avg_wind_speed": (0.0, 60.0),
+    "sunshine_hours": (0.0, 24.0),
+}
 _ROUND = {"avg_temperature": 1, "max_temperature": 1, "min_temperature": 1,
           # avg_humidity 源列是 BIGINT（整型），修复值若带小数回写会被截断，故取整
           "avg_humidity": 0, "precipitation": 1, "avg_wind_speed": 2, "sunshine_hours": 2}
@@ -824,6 +841,45 @@ BEST_METHOD = {
 }
 # krig 不适用的指标（降水为间断非高斯事件，加性克里金实测显著更差 → 自动退回 clima）
 KRIG_UNSUITED = ("precipitation",)
+
+
+def _daylength(lat, doy):
+    """天文可照时数（小时）—— 日出到日落的几何上限，不考虑地形遮挡与大气折射。
+
+    cos(H) = -tan(lat)·tan(dec)，dec = 23.44° · sin(360/365 · (doy-81))
+    日照时数在物理上不可能超过这个值（超过即为不可能的观测）。
+    极昼/极夜时 cos(H) 超出 [-1,1]，分别按 24h / 0h 处理。
+    """
+    if lat is None or not np.isfinite(lat):
+        return None
+    dec = math.radians(23.44) * math.sin(2.0 * math.pi * (doy - 81) / 365.0)
+    x = -math.tan(math.radians(float(lat))) * math.tan(dec)
+    if x <= -1.0:
+        return 24.0
+    if x >= 1.0:
+        return 0.0
+    return 24.0 * math.acos(x) / math.pi
+
+
+def _temp_consistency(vals):
+    """温度三列内部一致性检查：返回违反的规则名列表。
+
+    物理约束：min_temperature ≤ avg_temperature ≤ max_temperature。
+    这是**最硬**的判据 —— 不依赖任何历史统计，只要三列同时有值就必定成立。
+    2026-11-26 全库量化（16,966,797 行）：
+      max<avg  11 行、avg<min 1,660 行、max<min  8 行，合计 1,671 行。
+    其中 avg<min 的 1,660 行里有 1,640 行集中在站点 1610（列互换），
+    旧版 repair_scan 只检查 max<min（8 行），漏掉了 99.5% 的自洽性错误。
+    """
+    out = []
+    mx, av, mn = vals.get("max_temperature"), vals.get("avg_temperature"), vals.get("min_temperature")
+    if mx is not None and mn is not None and mx < mn:
+        out.append("max<min")
+    if mx is not None and av is not None and mx < av:
+        out.append("max<avg")
+    if av is not None and mn is not None and av < mn:
+        out.append("avg<min")
+    return out
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -961,7 +1017,11 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
              t AS (SELECT %s AS date, * FROM weather_hist WHERE %s)
         SELECT count(DISTINCT cal.date) AS days, count(t.station_id) AS rows_present, %s,
                count(*) FILTER (WHERE t.max_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
-                                AND t.max_temperature < t.min_temperature) AS inconsistent_maxmin
+                                AND t.max_temperature < t.min_temperature) AS inconsistent_maxmin,
+               count(*) FILTER (WHERE t.max_temperature IS NOT NULL AND t.avg_temperature IS NOT NULL
+                                AND t.max_temperature < t.avg_temperature) AS inconsistent_maxavg,
+               count(*) FILTER (WHERE t.avg_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
+                                AND t.avg_temperature < t.min_temperature) AS inconsistent_avgmin
         FROM cal LEFT JOIN t ON cal.date = t.date
     """ % (d1, d2, dc, cond, ", ".join(aggs))).iloc[0].to_dict()
 
@@ -982,6 +1042,10 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
            OR %s
            OR (t.max_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
                AND t.max_temperature < t.min_temperature)
+           OR (t.max_temperature IS NOT NULL AND t.avg_temperature IS NOT NULL
+               AND t.max_temperature < t.avg_temperature)
+           OR (t.avg_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
+               AND t.avg_temperature < t.min_temperature)
         ORDER BY cal.date LIMIT %d
     """ % (d1, d2, dc, cond,
            " OR ".join("(t.%s IS NULL OR t.%s NOT BETWEEN %f AND %f)" % (m, m, lo, hi)
@@ -999,9 +1063,14 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
                     problems.append(m + ":missing")
                 elif vals[m] < lo or vals[m] > hi:
                     problems.append(m + ":out_of_range")
-            if vals["max_temperature"] is not None and vals["min_temperature"] is not None \
-                    and vals["max_temperature"] < vals["min_temperature"]:
-                problems.append("max<min")
+            # 温度三列内部一致性（物理约束 min ≤ avg ≤ max，不依赖历史统计）
+            # 旧版只查 max<min（全库 8 行），漏掉 avg<min 的 1,660 行（99.5%）
+            problems.extend(_temp_consistency(vals))
+            # 日照不可能超过天文可照时数
+            dl = _daylength(info.get("latitude"), pd.Timestamp(r["date"]).dayofyear)
+            if vals["sunshine_hours"] is not None and dl is not None \
+                    and vals["sunshine_hours"] > dl + 0.5:
+                problems.append("sunshine>daylength")
         rows.append({"date": str(r["date"]), "values": vals, "problems": sorted(set(problems))})
     return {
         "station": {"station_id": sid, "station_name": info.get("station_name"),
@@ -1009,6 +1078,10 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
         "period": {"from": d1, "to": d2},
         "summary": {"days": int(s["days"]), "rows_present": int(s["rows_present"]),
                     "inconsistent_maxmin": int(s["inconsistent_maxmin"]),
+                    "inconsistent_maxavg": int(s["inconsistent_maxavg"]),
+                    "inconsistent_avgmin": int(s["inconsistent_avgmin"]),
+                    "inconsistent_total": int(s["inconsistent_maxmin"]) + int(s["inconsistent_maxavg"])
+                                          + int(s["inconsistent_avgmin"]),
                     "per_metric": per_metric},
         "bad_rows": rows,
         "bad_rows_shown": len(rows),
@@ -1017,25 +1090,31 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
 
 def hidden_scan(station_id, date=None, start=None, end=None, year=None,
                 metric=None, k=12, radius_km=200, sigma=1.0, spatial_sigma=6.0,
-                detail_limit=500):
+                baseline="rolling", detail_limit=500):
     """隐性异常扫描：找「物理范围内、但数值可疑」的值 —— 只报告，绝不自动修复。
 
-    与 repair_scan 的区别：repair_scan 只抓哨兵值（32766/999999/超物理范围/缺测），
-    本函数抓的是「看着合理但其实错了」的隐性异常，用两条互补规则（2026-11-26 注入实验：
+    与 repair_scan 的区别：repair_scan 只抓哨兵值（32766/999999/超物理范围/缺测/温度自洽性），
+    本函数抓的是「看着合理但其实错了」的隐性异常，用三条互补规则（2026-11-26 注入实验：
     210 个隐性异常，历史极值法 100% 精确/50% 检出，邻站对比 62% 精确/51% 检出，
     两者取并集 67% 精确/62% 检出）：
 
-      record  超过本站该月历史极值（1991-2020）± sigma 个稳健标准差（1.4826×MAD）。
+      record  超过本站该月历史极值 ± sigma 个稳健标准差（1.4826×MAD）。
               这是「知道一个地方最高值是多少再筛查」的思路 —— 零误报，但只抓超历史记录的。
+              baseline="rolling"（默认）用该月前后各 15 年的滚动极值；baseline="fixed" 用
+              1991-2020 固定期。**滚动是必须的**：新乡站实测固定期基线在 1950-70 年代产生
+              132 条误报（占全部 156 条的 85%），根因是气候漂移（该站 1 月均温 1951-60 为
+              -1.22℃、2011-20 为 +0.57℃，升温 1.8℃），拿现在的极值去判 70 年前的数据必然误报。
       spatial 当日值与同日邻站中位数的偏离超过 spatial_sigma 个稳健标准差（距平域，
               已扣各自月气候基准，消除海拔/纬度系统差）—— 能抓邻站都正常、只有本站离谱的。
 
     降水为偏态分布（气候中位数常为 0，一场暴雨 z 就爆表），故 spatial 阈值对降水更保守：
     只有偏离超过 spatial_sigma 倍且倍数达到 5× 才报，避免把真暴雨误报。
 
-    返回 {station, period, rules, summary, suspects[]}，每条 suspect 含
-    {date, metric, value, rules[], confidence, detail{...}}，confidence=high 表示两条规则
-    都命中（最可信），medium 表示单条命中（需人工确认）。"""
+    超 PHYS_STRICT（更紧的合理性边界）的值也会被报出来，标 rule="implausible"。
+
+    返回 {station, period, rules, baseline, summary, suspects[]}，每条 suspect 含
+    {date, metric, value, rules[], confidence, detail{...}}，confidence=high 表示两条以上规则
+    命中（最可信），medium 表示单条命中（需人工确认）。"""
     sid = int(station_id)
     info = station_detail(sid)
     if info is None:
@@ -1045,6 +1124,8 @@ def hidden_scan(station_id, date=None, start=None, end=None, year=None,
     for m in ms:
         if not metric_ok(m):
             raise ValueError("metric 必须是 %s" % ", ".join(METRICS))
+    if baseline not in ("rolling", "fixed"):
+        raise ValueError("baseline 只能是 rolling 或 fixed")
 
     cols = ", ".join(ms)
     # 1) 目标站区间原始值
@@ -1061,28 +1142,53 @@ def hidden_scan(station_id, date=None, start=None, end=None, year=None,
     tdt = pd.to_datetime(tgt["d"])
     tmo = tdt.dt.month.to_numpy()
 
-    # 2) 训练期（1991-2020）逐月历史极值 + 稳健标准差（1.4826×MAD）
-    tr = _df(f"""SELECT month(date_true) AS mo, {cols} FROM weather_hist
-                 WHERE station_id = {sid} AND year(date_true) BETWEEN 1991 AND 2020""")
-    clim = {}
-    for m in ms:
-        v = pd.to_numeric(tr[m], errors="coerce")
-        lo, hi = PHYS_RANGE[m]
-        ok = tr.loc[(v >= lo) & (v <= hi), ["mo"]].copy()
-        ok[m] = v[(v >= lo) & (v <= hi)]
-        if ok.empty:
-            clim[m] = None
-            continue
-        g = ok.groupby("mo")[m]
-        med = g.median()
-        mad = g.apply(lambda x: (x - x.median()).abs().median())
-        sd = (1.4826 * mad).replace(0, np.nan)
-        gmed, gmad = ok[m].median(), 1.4826 * (ok[m] - ok[m].median()).abs().median()
-        med = med.reindex(range(1, 13)).fillna(gmed)
-        sd = sd.reindex(range(1, 13)).fillna(gmad if gmad > 0 else 1.0)
-        clim[m] = {"lo": g.min().reindex(range(1, 13)).fillna(ok[m].min()),
-                   "hi": g.max().reindex(range(1, 13)).fillna(ok[m].max()),
-                   "med": med, "sd": sd}
+    # 2) 逐月历史极值 + 稳健标准差（1.4826×MAD）
+    #    baseline="rolling" 时按年滚动：目标区间的每一年，用该年 ±15 年的窗口拟合，
+    #    这样 1950 年代的值不会被 1991-2020 的暖化极值误判（新乡实测减少 85% 误报）。
+    tr_years = sorted({int(x) for x in tdt.dt.year.unique()})
+    rolling = (baseline == "rolling")
+    win = 15
+    if rolling:
+        y_lo = min(tr_years) - win
+        y_hi = max(tr_years) + win
+    else:
+        y_lo, y_hi = 1991, 2020
+    tr = _df(f"""SELECT year(date_true) AS yr, month(date_true) AS mo, {cols} FROM weather_hist
+                 WHERE station_id = {sid} AND year(date_true) BETWEEN {y_lo} AND {y_hi}""")
+    # 先算 (year, month) 粒度的极值与 MAD，滚动窗口再按年合并
+    # 注意：滚动窗口必须**排除目标年本身**（leave-one-year-out）。若把目标年算进基线，
+    # 该年的值就成了自己的极值，永远不可能超 —— 实测会退化成 record 规则 0 命中。
+    clim_by_year = {}
+    for yr in tr_years:
+        if rolling:
+            sub = tr[((tr["yr"] >= yr - win) & (tr["yr"] <= yr - 1))
+                     | ((tr["yr"] >= yr + 1) & (tr["yr"] <= yr + win))]
+        else:
+            sub = tr[(tr["yr"] >= 1991) & (tr["yr"] <= 2020)]
+        if sub.empty:
+            sub = tr
+        cdict = {}
+        for m in ms:
+            v = pd.to_numeric(sub[m], errors="coerce")
+            lo, hi = PHYS_RANGE[m]
+            ok = sub.loc[(v >= lo) & (v <= hi), ["mo"]].copy()
+            ok[m] = v[(v >= lo) & (v <= hi)]
+            if ok.empty:
+                cdict[m] = None
+                continue
+            g = ok.groupby("mo")[m]
+            med = g.median()
+            mad = g.apply(lambda x: (x - x.median()).abs().median())
+            sd = (1.4826 * mad).replace(0, np.nan)
+            gmed, gmad = ok[m].median(), 1.4826 * (ok[m] - ok[m].median()).abs().median()
+            med = med.reindex(range(1, 13)).fillna(gmed)
+            sd = sd.reindex(range(1, 13)).fillna(gmad if gmad > 0 else 1.0)
+            cdict[m] = {"lo": g.min().reindex(range(1, 13)).fillna(ok[m].min()),
+                        "hi": g.max().reindex(range(1, 13)).fillna(ok[m].max()),
+                        "med": med, "sd": sd}
+        clim_by_year[yr] = cdict
+    # 兼容：clim 供后续按 (year) 取
+    clim = clim_by_year
 
     # 3) 邻站同日值（距平域对比用）
     nb = stations_near(info["latitude"], info["longitude"], radius_km=radius_km, limit=int(k) + 4)
@@ -1104,13 +1210,16 @@ def hidden_scan(station_id, date=None, start=None, end=None, year=None,
             nq[m] = v
             nbm[m] = nq.groupby("d")[m].median()
 
-    # 4) 逐日逐指标套用两条规则
+    # 4) 逐日逐指标套用各条规则
     suspects = []
     by_metric = {m: 0 for m in ms}
-    by_rule = {"record": 0, "spatial": 0, "both": 0}
+    by_rule = {"record": 0, "spatial": 0, "implausible": 0, "both": 0}
+    tgt_year = tdt.dt.year.to_numpy()
     for i, row in tgt.iterrows():
         d = row["d"]
         mo = int(tmo[i])
+        yr = int(tgt_year[i])
+        cy = clim.get(yr) or clim_by_year.get(min(clim_by_year), {})
         for m in ms:
             v = row[m]
             if pd.isna(v):
@@ -1119,21 +1228,34 @@ def hidden_scan(station_id, date=None, start=None, end=None, year=None,
             lo, hi = PHYS_RANGE[m]
             if v < lo or v > hi:      # 超物理范围的归 repair_scan 管，这里不重复
                 continue
-            c = clim.get(m)
+            c = cy.get(m)
+            rules, detail = [], {}
+            # 规则0：超出「合理性边界」PHYS_STRICT（比 PHYS_RANGE 紧，但仍属硬判据）
+            slo, shi = PHYS_STRICT[m]
+            if v < slo or v > shi:
+                rules.append("implausible")
+                detail["implausible"] = {"strict_range": [slo, shi]}
             if c is None:
+                if rules:
+                    by_metric[m] += 1
+                    for r in rules:
+                        by_rule[r] += 1
+                    suspects.append({"date": d, "metric": m, "value": round(v, 2),
+                                     "rules": rules, "confidence": "medium",
+                                     "detail": detail, "neighbors": []})
                 continue
             sd = float(c["sd"].get(mo, 1.0))
             if not np.isfinite(sd) or sd <= 0:
                 sd = 1.0
-            rules, detail = [], {}
-            # 规则1：超本站该月历史极值 ± sigma×稳健标准差
+            # 规则1：超本站该月历史极值 ± sigma×稳健标准差（滚动基线）
             rec_lo = float(c["lo"].get(mo)) - sigma * sd
             rec_hi = float(c["hi"].get(mo)) + sigma * sd
             if v > rec_hi or v < rec_lo:
                 rules.append("record")
                 detail["record"] = {"month": mo, "hist_min": round(float(c["lo"].get(mo)), 2),
                                     "hist_max": round(float(c["hi"].get(mo)), 2),
-                                    "limit": [round(rec_lo, 2), round(rec_hi, 2)]}
+                                    "limit": [round(rec_lo, 2), round(rec_hi, 2)],
+                                    "baseline": ("rolling±%d年" % win) if rolling else "1991-2020"}
             # 规则2：与同日邻站中位偏离（降水用倍数法更保守）
             if m in nbm and d in nbm[m].index:
                 nmed = float(nbm[m].loc[d])
@@ -1151,10 +1273,10 @@ def hidden_scan(station_id, date=None, start=None, end=None, year=None,
                                                  "deviation": round(v - nmed, 2)}
             if not rules:
                 continue
-            confidence = "high" if len(rules) == 2 else "medium"
+            confidence = "high" if len(rules) >= 2 else "medium"
             for r in rules:
                 by_rule[r] += 1
-            if len(rules) == 2:
+            if len(rules) >= 2:
                 by_rule["both"] += 1
             by_metric[m] += 1
             # 邻站明细（用了哪些站的数据判断）
@@ -1180,7 +1302,8 @@ def hidden_scan(station_id, date=None, start=None, end=None, year=None,
         "station": {"station_id": sid, "station_name": info.get("station_name"),
                     "province": info.get("province")},
         "period": {"from": d1, "to": d2},
-        "rules": ["record", "spatial"],
+        "rules": ["record", "spatial", "implausible"],
+        "baseline": ("rolling±%d年" % win) if rolling else "1991-2020",
         "summary": {"days": len(tgt), "suspects": len(suspects),
                     "by_metric": by_metric, "by_rule": by_rule},
         "suspects": suspects[:int(detail_limit)],
@@ -2106,6 +2229,138 @@ def repair_new_batch(batch=None, auto_latest=True, lookback_days=0,
         pd.DataFrame(out["rows"]).to_csv(f, index=False, encoding="utf-8-sig")
         out["csv_file"] = f
     return out
+
+
+def column_swap_scan(station_id=None, province=None, station_ids=None,
+                     min_rows=10, fix_ratio=0.95):
+    """列互换检测：找出「整列数据被写错列」的站点 —— 这类错误用插值修不了，必须整列还原。
+
+    **为什么需要单独的检测**：数据里最隐蔽的一类错误不是「某个值异常」，而是「整列被换走」。
+    此时每个值单独看都在合理范围内（1.1℃ 是合法气温、13.6m/s 是合法风速），任何基于
+    取值范围的判据都抓不到。唯一可靠的线索是**跨列的内部矛盾**。
+
+    判据（纯物理约束，不依赖任何历史统计）：
+      物理上平均气温不可能低于当日最低气温（avg ≥ min）。若某站出现大量 avg < min，
+      把 avg_temperature 与 avg_wind_speed 两列对调后这些矛盾消失，即判定为两列互换。
+
+    2026-11-26 全库实测：876 站中**仅站点 1610（四川盐源，56565，海拔 2516.8m）**命中，
+    自 2013-10-01 起 a/w 两列互换（此前 2013-09-30 为 a=13.8/w=1.2，次日变为 a=1.1/w=13.6）。
+    该站 2013-10 之后 2,404 行全部受影响，其中 1,640 行 avg<min；
+    对调后 1,640/1,640 = 100% 满足 min ≤ avg ≤ max。
+    其余站点 avg<min 最多 2 行（个别真实录入错误），不会被误判。
+
+    参数：
+      min_rows   至少要有多少行 avg<min 才纳入判定（默认 10，远高于噪声水平）
+      fix_ratio  对调后矛盾消除的最低比例（默认 0.95）
+
+    返回 {stations: [...], summary}，每站含
+    {station_id, station_name, province, swap_pair, rows_affected, contradict_rows,
+     fixed_ratio, breakpoint, before_after}
+    其中 breakpoint 是互换起始日（该日前后分别统计），before_after 给出互换前后的列均值，
+    便于人工核对。**本函数只检测，不修改任何数据**。"""
+    if station_id is not None:
+        ids = [int(station_id)]
+    else:
+        ids = _batch_stations(province=province, station_ids=station_ids, limit=None)
+    GLOB = TD_GLOB
+    out, failed = [], []
+    for sid in ids:
+        try:
+            info = station_detail(sid)
+            if info is None:
+                continue
+            q = _df(f"""
+                WITH t AS (
+                    SELECT date_true,
+                           avg_temperature AS a, max_temperature AS mx, min_temperature AS mn,
+                           avg_wind_speed AS w
+                    FROM weather_hist WHERE station_id = {sid}
+                )
+                SELECT count(*) AS n,
+                       count(*) FILTER (WHERE a IS NOT NULL AND mn IS NOT NULL AND a < mn) AS bad,
+                       count(*) FILTER (WHERE a IS NOT NULL AND mn IS NOT NULL AND a < mn
+                                          AND w IS NOT NULL AND w >= mn AND w <= mx) AS bad_fixed_by_swap,
+                       round(avg(a), 2) AS mean_a, round(avg(w), 2) AS mean_w,
+                       round(min(a), 1) AS min_a, round(max(a), 1) AS max_a,
+                       round(min(w), 1) AS min_w, round(max(w), 1) AS max_w,
+                       sum(CASE WHEN a BETWEEN -60 AND 55 THEN 1 ELSE 0 END) AS a_in_temp,
+                       sum(CASE WHEN w BETWEEN 0 AND 60 THEN 1 ELSE 0 END) AS w_in_wind
+                FROM t
+            """).iloc[0].to_dict()
+            n_bad = int(q["bad"])
+            if n_bad < int(min_rows):
+                continue
+            ratio = int(q["bad_fixed_by_swap"]) / float(n_bad)
+            if ratio < float(fix_ratio):
+                continue
+            # 找分界日：列互换是**持续**错误，故取「最长连续年份段」的起始年。
+            # 不能用第一个出现矛盾的年份（1610 站 1968-1970 另有 12 行零星真实录入错误，
+            # 会误判成 1968 起始）；也不能用累计占比（2013-2020 各年数量接近，会选到 2019）。
+            bd = _df(f"""
+                SELECT strftime(date_true, '%Y') AS y, count(*) AS c
+                FROM weather_hist
+                WHERE station_id = {sid}
+                  AND avg_temperature IS NOT NULL AND min_temperature IS NOT NULL
+                  AND avg_temperature < min_temperature
+                GROUP BY 1 ORDER BY 1
+            """)
+            breakpoint = None
+            if not bd.empty:
+                ys = [int(x) for x in bd["y"].tolist()]
+                # 切分连续年份段，取覆盖矛盾行最多的那一段（并列时取更早的）
+                runs, cur = [], [ys[0]]
+                for y in ys[1:]:
+                    if y == cur[-1] + 1:
+                        cur.append(y)
+                    else:
+                        runs.append(cur)
+                        cur = [y]
+                runs.append(cur)
+                cnt = {int(r["y"]): int(r["c"]) for _, r in bd.iterrows()}
+                best = max(runs, key=lambda rr: (sum(cnt[y] for y in rr), -rr[0]))
+                edge_year = best[0]
+                bm = _df(f"""
+                    SELECT strftime(date_true, '%Y-%m') AS ym, count(*) AS c
+                    FROM weather_hist
+                    WHERE station_id = {sid}
+                      AND avg_temperature IS NOT NULL AND min_temperature IS NOT NULL
+                      AND avg_temperature < min_temperature
+                      AND year(date_true) = {int(edge_year)}
+                    GROUP BY 1 ORDER BY 1
+                """)
+                if not bm.empty:
+                    breakpoint = str(bm.iloc[0]["ym"]) + "-01"
+            before_after = {}
+            if breakpoint:
+                for tag, op in (("before", "<"), ("after", ">=")):
+                    r = _df(f"""SELECT round(avg(avg_temperature),2) AS mean_a,
+                                       round(avg(avg_wind_speed),2) AS mean_w,
+                                       round(min(avg_temperature),1) AS min_a,
+                                       round(max(avg_temperature),1) AS max_a,
+                                       count(*) AS n
+                                FROM weather_hist
+                                WHERE station_id = {sid} AND date_true {op} DATE '{breakpoint}'
+                                  AND avg_temperature BETWEEN -100 AND 100
+                                  AND avg_wind_speed BETWEEN 0 AND 200""").iloc[0].to_dict()
+                    before_after[tag] = {k: (None if pd.isna(v) else v) for k, v in r.items()}
+            out.append({
+                "station_id": sid, "station_name": info.get("station_name"),
+                "province": info.get("province"), "swap_pair": ["avg_temperature", "avg_wind_speed"],
+                "rows_affected": n_bad, "contradict_rows": n_bad,
+                "fixed_ratio": round(ratio, 4), "breakpoint": breakpoint,
+                "before_after": before_after,
+                "advice": ("该站 %s 起 avg_temperature 与 avg_wind_speed 两列被互换，"
+                           "修复方式是把这两列的值对调回来（不是插值）。"
+                           "受影响行数约 %d。" % (breakpoint or "某日", n_bad)),
+            })
+        except Exception as e:
+            failed.append({"station_id": sid, "error": "%s: %s" % (type(e).__name__, e)})
+    return {
+        "scanned_stations": len(ids),
+        "summary": {"found": len(out), "failed": len(failed),
+                    "criteria": {"min_rows": int(min_rows), "fix_ratio": float(fix_ratio)}},
+        "stations": out, "failed": failed,
+    }
 
 
 def repair_overview(year=None, start=None, end=None, province=None,

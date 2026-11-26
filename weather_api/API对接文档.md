@@ -3,7 +3,7 @@
 > 面向**接口调用方**：数据由服务端提供，你只需按本文档调用接口、取返回数据。
 > 不需要接触任何数据库或数据文件。
 >
-> 服务地址：`http://<服务器IP>:8900`　　接口总数：32 个（全部 GET）
+> 服务地址：`http://<服务器IP>:8900`　　接口总数：34 个（全部 GET）
 > 在线文档：`<服务地址>/docs`（Swagger，可直接在页面里试调用）
 > 所有示例里把 `127.0.0.1:8900` 换成实际服务器地址。
 
@@ -440,15 +440,21 @@
 | `date` / `start` / `end` / `year` | — | — | 四选一定区间 |
 | `detail_limit` | int | 500 | 最多返回坏日明细行数（1~100000） |
 
-返回 `data`：`{station, period, summary{days, rows_present, inconsistent_maxmin, per_metric}, bad_rows[{date, values, problems}], bad_rows_shown}`。
+返回 `data`：`{station, period, summary{days, rows_present, inconsistent_maxmin, inconsistent_maxavg, inconsistent_avgmin, inconsistent_total, per_metric}, bad_rows[{date, values, problems}], bad_rows_shown}`。
+
+> **v0.12 判据升级**：除物理范围与哨兵值外，还检查
+> ① **温度三列自洽性**：必须满足 `min ≤ avg ≤ max`，违反的记为 `max<min`/`max<avg`/`avg<min`（全库 avg<min 有 1,660 行，旧版只查 max<min 的 8 行，这是原先最大的漏检口）；
+> ② **日照超天文上限**：日照时数 > 当天按纬度算出的可照时数 + 0.5h（全库仅 145 行，误报极低）。
+> 实测：`repair_scan(1610, year=2019)` 旧版报 0 行，新版报 250 行（该站 avg<min 全部命中）；正常站新乡 `inconsistent_total=0` 不误报。
 
 #### `GET /api/repair/hidden_scan` ★ 隐性异常发现（只报不修）
-补 `repair/scan` 的盲区：后者只看物理范围，只能抓 32766/999999 这类哨兵值；本接口找**数值在合法范围内、但疑似错误**的隐性异常（例如某天温度被错记成 5℃ 而不是 15℃）。两条互补规则：
+补 `repair/scan` 的盲区：后者只看物理范围/自洽性，抓不到「数值在合法范围内但错误」的隐性异常（例如某天温度被错记成 5℃ 而不是 15℃）。三条互补规则：
 
 | 规则 | 依据 | 特点 |
 |---|---|---|
-| `record` | 超过本站该月 1991–2020 历史极值 ± `sigma`×稳健标准差（1.4826×MAD） | 零误报（报出来基本就是问题），但只抓超历史记录的 |
-| `spatial` | 与同日邻站中位数偏离超 `spatial_sigma`×稳健标准差（降水用倍数法避免把真暴雨误报） | 能抓「邻站都正常、只有本站离谱」的情况 |
+| `record` | 超过本站该月**滚动 ±15 年**（留一年交叉验证）历史极值 ± `sigma`×稳健标准差（1.4826×MAD） | 零误报（报出来基本就是问题），但只抓超历史记录的 |
+| `spatial` | 与同日邻站中位数偏离超 `spatial_sigma`×稳健标准差（降水用 ≥5 倍比值法避免把真暴雨误报） | 能抓「邻站都正常、只有本站离谱」的情况 |
+| `implausible` | 超 `PHYS_STRICT` 严格边界（气温 -60~55、最高 -55~55、最低 -65~45、风速 0~60 等） | 兜底，比宽泛 ±100 更早发现 |
 
 参数：
 
@@ -461,19 +467,48 @@
 | `radius_km` | float | 200 | 邻站搜索半径 km |
 | `sigma` | float | 1.0 | 历史极值法的容差（稳健标准差倍数，0~10） |
 | `spatial_sigma` | float | 6.0 | 空间偏离阈值（稳健标准差倍数） |
+| `baseline` | str | **rolling** | `rolling`=滚动 ±15 年（推荐，抗气候漂移）/ `fixed`=固定 1991-2020（老版本行为） |
 | `detail_limit` | int | 500 | 最多返回疑似条数（1~100000） |
 
-返回 `data`：`{station, period, rules, summary{days, suspects, by_metric, by_rule}, suspects[]}`。
+> **为什么默认 rolling**：固定 1991-2020 基线会把 1950-70 年代的正常偏冷误判成异常（新乡实测固定基线 156 条 record 命中里 132 条是气候漂移误报；该站 1 月均温 1951-60 为 -1.22℃，2011-20 为 +0.57℃，升了 1.8℃）。改滚动后 record 命中 171→74，1960 年代误报 145→69。实测对比：固定 610 条 → 滚动 498 条。
+
+返回 `data`：`{station, period, baseline, rules, summary{days, suspects, by_metric, by_rule}, suspects[]}`。
 每条 `suspect`：`{date, metric, value, rules[], confidence, detail, neighbors[]}`：
-- `rules`：命中的规则（`record`/`spatial`/两者都有）
-- `confidence`：`high`=两规则都命中（最可信），`medium`=单条命中（需人工确认）
-- `detail`：各规则的判定数值（历史极值范围、邻站中位、偏离量/倍数）
+- `rules`：命中的规则（`record`/`spatial`/`implausible`，可多个）
+- `confidence`：`high`=≥2 条规则都命中（最可信），`medium`=单条命中（需人工确认）
+- `detail`：各规则的判定数值（历史极值范围、判定窗、邻站中位、偏离量/倍数）
 - `neighbors`：**判断时实际用到的邻站实测值**（站号/站名/距离/值）——让调用方看到依据
 
 > **只报告，绝不自动修复**。极端暴雨、大风本就是真事件（实测 1608 条降水统计极端全是真暴雨），是否当异常处理须由业务方确认。实测有效性：往干净数据注入 210 个「物理范围内但错误」的值，历史极值法 100% 精确、极值∪邻站 62% 检出。
 
 ```bash
 curl "http://127.0.0.1:8900/api/repair/hidden_scan?station_id=1382&year=1991"
+curl "http://127.0.0.1:8900/api/repair/hidden_scan?station_id=1382&start=1951-01-01&end=2025-12-31&baseline=rolling"
+```
+
+#### `GET /api/repair/column_swap` ★ 整列互换检测
+识别「两列数值被**整体对调**」这类结构性错误 —— 这类错误单看每个值都合理，所有阈值判据都抓不到，但会导致整段数据完全错误。
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `station_id` | int | — | 单站检测 |
+| `province` | str | — | 按省批量 |
+| `station_ids` | str | — | 逗号分隔 |
+| `min_rows` | int | 10 | 至少多少行矛盾才判 |
+| `fix_ratio` | float | 0.95 | 对调后矛盾消除比例阈值 |
+
+返回 `data`：`{scanned_stations, summary{found, failed, criteria}, stations[], failed[]}`。
+每条命中项：`{station_id, station_name, province, swap_pair, rows_affected, contradict_rows, fixed_ratio, breakpoint, before_after{before, after}, advice}`：
+- `swap_pair`：互换的两列（如 `["avg_temperature", "avg_wind_speed"]`）
+- `breakpoint`：从哪一天开始互换（分界日）
+- `fixed_ratio`：把这些行两列对调后，满足 `min ≤ 风速 ≤ max` 的比例
+- `before_after`：互换前/后的均值与范围对比 —— 用来确认「对调后统计变回正常」
+
+> **修复方式是对调，不是插值**。实测全库 909 站只有 **1610 站（四川盐源，海拔 2516.8m）** 命中：从 **2013-10-01** 起 `avg_temperature` 与 `avg_wind_speed` 两列互换，影响 1,653 行，对调后矛盾消除率 **99.21%**。对调前 a 列均值 2.54、范围 [0.3, 9.4]；对调后 12.52、范围与互换前（12.44 / [-5.4, 24.0]）高度吻合。新乡等正常站 `found=0`。
+
+```bash
+curl "http://127.0.0.1:8900/api/repair/column_swap?station_id=1610"
+curl "http://127.0.0.1:8900/api/repair/column_swap"          # 全库扫描（约 79 秒）
 ```
 
 #### `GET /api/repair/daily`

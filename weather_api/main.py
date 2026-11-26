@@ -36,7 +36,7 @@ app = FastAPI(
     title="气象数据查询 API",
     description="基于本地镜像的 1951–2025 全国 876 站逐日气象数据查询接口。"
                 "时间戳已自动修正（源库偏移 +100 年）。",
-    version="0.11.0",
+    version="0.12.0",
     default_response_class=UTF8JSONResponse,
 )
 app.add_middleware(
@@ -514,18 +514,53 @@ def api_repair_hidden_scan(
     radius_km: float = Query(200, gt=0, le=2000, description="邻站搜索半径 km"),
     sigma: float = Query(1.0, ge=0, le=10, description="历史极值法的容差（稳健标准差倍数）"),
     spatial_sigma: float = Query(6.0, gt=0, le=100, description="空间偏离阈值（稳健标准差倍数）"),
+    baseline: str = Query("rolling", pattern="^(rolling|fixed)$",
+                          description="历史极值基线：rolling=目标年±15年滚动（默认，抗气候漂移）；fixed=1991-2020"),
     detail_limit: int = Query(500, ge=1, le=100000, description="最多返回多少条疑似"),
 ):
     """补 repair/scan 的盲区：后者只看物理范围，抓不到「数值合法但其实错了」的隐性异常。
-    本接口用两条规则（2026-11-26 注入实验：历史极值 100% 精确、邻站对比 + 极值并集 62% 检出）：
-      record  超本站该月 1991-2020 历史极值 ± sigma×1.4826×MAD —— 报出来基本就是问题；
-      spatial 与同日邻站中位数偏离超阈值（降水用倍数法避免误报真暴雨）。
-    每条疑似带命中的规则、confidence（high=两规则都中）、以及判断时用到的邻站实测值明细。
+    本接口用三条规则（2026-11-26 注入实验：历史极值 100% 精确、邻站对比 + 极值并集 62% 检出）：
+      record      超本站该月历史极值 ± sigma×1.4826×MAD —— 报出来基本就是问题；
+                  baseline=rolling（默认）按目标年 ±15 年滚动，避免用现代的极值误判 1950 年代
+                  （新乡站实测：固定 1991-2020 基线在 1950-70 年代有 132 条误报，占 85%）；
+      spatial     与同日邻站中位数偏离超阈值（降水用倍数法避免误报真暴雨）；
+      implausible 超出更紧的合理性边界 PHYS_STRICT（气温 -60~55 等）。
+    每条疑似带命中的规则、confidence（high=两条以上规则都中）、以及判断时用到的邻站实测值明细。
     **只报告，不自动修复** —— 暴雨/大风本就是真事件，是否改由业务方确认。"""
     try:
         return ok(D.hidden_scan(station_id, date=date, start=start, end=end, year=year,
                                 metric=metric, k=k, radius_km=radius_km, sigma=sigma,
-                                spatial_sigma=spatial_sigma, detail_limit=detail_limit))
+                                spatial_sigma=spatial_sigma, baseline=baseline,
+                                detail_limit=detail_limit))
+    except ValueError as e:
+        return err(str(e))
+
+
+@app.get("/api/repair/column_swap", tags=["异常修复"],
+         summary="列互换检测（整列被写错列，如 avg_temperature 与 avg_wind_speed 互换）")
+def api_repair_column_swap(
+    station_id: int = Query(None, description="只查一个站；不传则按 province/station_ids 或全库"),
+    province: str = Query(None, description="按省筛选（省份简称）"),
+    station_ids: str = Query(None, description="逗号分隔的站点 ID 列表"),
+    min_rows: int = Query(10, ge=2, le=100000,
+                          description="至少多少行 avg<min 才纳入判定（默认 10，远高于噪声）"),
+    fix_ratio: float = Query(0.95, ge=0.5, le=1.0,
+                             description="两列对调后矛盾消除的最低比例"),
+):
+    """检测「整列被互换」这类插值修不了的错误：每个值单独看都合法（1.1℃ 是合法气温、
+    13.6m/s 是合法风速），任何取值范围判据都抓不到，只能靠跨列物理矛盾
+    （平均气温不可能低于当日最低气温）识别，并用「对调后矛盾是否消失」来确认。
+
+    2026-11-26 全库扫描（909 站 78.8s）：**仅站点 1610（四川盐源）命中** ——
+    自 2013-10-01 起 avg_temperature 与 avg_wind_speed 被互换，1,653 行 avg<min，
+    对调后 99.21% 的矛盾消失；互换前 a 列均值 12.44 / w 列 2.42，
+    互换后原样 a 列 2.54 / w 列 12.57（对调即回到 12.5 / 2.5）。
+    修复方式是**把两列值对调回来**，不是插值。**本接口只检测，不修改数据**。"""
+    try:
+        ids = [int(x) for x in station_ids.split(",") if x.strip()] if station_ids else None
+        return ok(D.column_swap_scan(station_id=station_id, province=province,
+                                     station_ids=ids, min_rows=min_rows,
+                                     fix_ratio=fix_ratio))
     except ValueError as e:
         return err(str(e))
 
