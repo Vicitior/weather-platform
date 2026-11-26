@@ -415,5 +415,35 @@ check("降水 own6 一律退回 clima", len(pr) == 1 and pr[0]["method"] == "cli
 check("降水退回说明间断变量", len(pr) == 1 and "间断" in (pr[0].get("note") or ""),
       pr[0].get("note") if pr else "")
 
+print("== 27. v0.11 隐性异常扫描 hidden_scan ==")
+hs = D.hidden_scan(1382, start="1991-01-01", end="2020-12-31", detail_limit=50)
+check("返回结构完整", all(k in hs for k in ("station", "period", "rules", "summary", "suspects")), list(hs))
+check("两条规则声明", "record" in hs["rules"] and "spatial" in hs["rules"], hs["rules"])
+check("汇总含 by_metric/by_rule", "by_metric" in hs["summary"] and "by_rule" in hs["summary"], hs["summary"])
+check("新乡确实扫出疑似", hs["summary"]["suspects"] > 0, hs["summary"]["suspects"])
+check("疑似按规则分组计数", sum(hs["summary"]["by_rule"][k] for k in ("record", "spatial")) >= hs["summary"]["suspects"], hs["summary"]["by_rule"])
+if hs["suspects"]:
+    s0 = hs["suspects"][0]
+    check("疑似结构完整", all(k in s0 for k in ("date", "metric", "value", "rules", "confidence", "detail", "neighbors")), list(s0))
+    check("confidence 枚举正确", s0["confidence"] in ("high", "medium"), s0["confidence"])
+    check("规则名合法", all(r in ("record", "spatial") for r in s0["rules"]), s0["rules"])
+    check("有邻站明细", isinstance(s0["neighbors"], list), s0["neighbors"][:1])
+    check("邻站含站名与距离", all("station_name" in n and "distance_km" in n for n in s0["neighbors"]), s0["neighbors"][:1])
+# 只报告不修复：hidden_scan 不产生 repaired 字段
+check("只报不修（无 repaired 字段）", all("repaired" not in s for s in hs["suspects"]), "ok")
+# 单指标筛选
+hs1 = D.hidden_scan(1382, year=1991, metric="avg_temperature", detail_limit=10)
+check("单指标筛选生效", all(s["metric"] == "avg_temperature" for s in hs1["suspects"]), hs1["suspects"][:1])
+# 超物理范围的值不出现在隐性扫描（归 repair_scan 管）
+hs_all = D.hidden_scan(1382, year=2016, detail_limit=100)
+check("哨兵值不重复报", all(
+    not (s["metric"] == "precipitation" and s["value"] > 1000) for s in hs_all["suspects"]), "ok")
+# 不存在站点报错
+try:
+    D.hidden_scan(999999, year=2020)
+    check("不存在站点报错", False, "")
+except ValueError:
+    check("不存在站点报错", True, "")
+
 print("\n===== %d passed, %d failed =====" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

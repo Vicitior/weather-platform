@@ -36,7 +36,7 @@ app = FastAPI(
     title="气象数据查询 API",
     description="基于本地镜像的 1951–2025 全国 876 站逐日气象数据查询接口。"
                 "时间戳已自动修正（源库偏移 +100 年）。",
-    version="0.10.0",
+    version="0.11.0",
     default_response_class=UTF8JSONResponse,
 )
 app.add_middleware(
@@ -497,6 +497,35 @@ def api_repair_scan(
     try:
         return ok(D.repair_scan(station_id, date=date, start=start, end=end,
                                 year=year, detail_limit=detail_limit))
+    except ValueError as e:
+        return err(str(e))
+
+
+@app.get("/api/repair/hidden_scan", tags=["异常修复"],
+         summary="隐性异常扫描（物理范围内但可疑：超月历史极值 / 与同日邻站显著偏离，只报不修）")
+def api_repair_hidden_scan(
+    station_id: int = Query(..., description="站点 ID"),
+    date: str = Query(None, description="单日 YYYY-MM-DD"),
+    start: str = Query(None, description="起始日"),
+    end: str = Query(None, description="结束日"),
+    year: int = Query(None, description="整年（四选一）"),
+    metric: str = Query(None, description="只查一个指标，默认全部 7 指标"),
+    k: int = Query(12, ge=1, le=32, description="参与空间对比的最近邻站数"),
+    radius_km: float = Query(200, gt=0, le=2000, description="邻站搜索半径 km"),
+    sigma: float = Query(1.0, ge=0, le=10, description="历史极值法的容差（稳健标准差倍数）"),
+    spatial_sigma: float = Query(6.0, gt=0, le=100, description="空间偏离阈值（稳健标准差倍数）"),
+    detail_limit: int = Query(500, ge=1, le=100000, description="最多返回多少条疑似"),
+):
+    """补 repair/scan 的盲区：后者只看物理范围，抓不到「数值合法但其实错了」的隐性异常。
+    本接口用两条规则（2026-11-26 注入实验：历史极值 100% 精确、邻站对比 + 极值并集 62% 检出）：
+      record  超本站该月 1991-2020 历史极值 ± sigma×1.4826×MAD —— 报出来基本就是问题；
+      spatial 与同日邻站中位数偏离超阈值（降水用倍数法避免误报真暴雨）。
+    每条疑似带命中的规则、confidence（high=两规则都中）、以及判断时用到的邻站实测值明细。
+    **只报告，不自动修复** —— 暴雨/大风本就是真事件，是否改由业务方确认。"""
+    try:
+        return ok(D.hidden_scan(station_id, date=date, start=start, end=end, year=year,
+                                metric=metric, k=k, radius_km=radius_km, sigma=sigma,
+                                spatial_sigma=spatial_sigma, detail_limit=detail_limit))
     except ValueError as e:
         return err(str(e))
 

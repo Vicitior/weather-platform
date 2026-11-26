@@ -59,6 +59,7 @@ python -m weather_api.main --port 9000
 | GET | `/api/report/table` | **气象数据填报表**（站点×12 月模板口径聚合 + 模板校验规则自动核查） |
 | GET | `/api/report/export` | **填报表导出**成 Word(.docx)/Excel(.xlsx) 成品文件（exports/ 目录） |
 | GET | `/api/repair/scan` | **缺测/异常扫描**：哨兵值（999999/32766）、超物理范围、max<min、缺行 |
+| GET | `/api/repair/hidden_scan` | **隐性异常扫描**：物理范围内但可疑（超本站该月历史极值 / 与同日邻站显著偏离），**只报不修**，附判断依据与邻站实测值 |
 | GET | `/api/repair/daily` | **异常值修复**：按坐标找最近 k 个邻站，用气候距平法重建（非简单复制最近站），空间法失效自动降级时间维 |
 | GET | `/api/repair/batches` | **录入批次列表**（按上传时间戳倒序，用于发现最新一批新数据） |
 | GET | `/api/repair/batch` | **批量补齐**：多站 × 一个区间一次跑完并汇总（`station_ids` 或 `province`） |
@@ -222,6 +223,9 @@ curl "http://127.0.0.1:8900/api/report/export?station_id=1124"
 # 扫描漠河 2020 年的缺测/异常（哨兵值、超物理范围、max<min、缺行）
 curl "http://127.0.0.1:8900/api/repair/scan?station_id=1124&year=2020"
 
+# 隐性异常（数值合法但可疑，只报不修）：超历史极值 / 与同日邻站偏离
+curl "http://127.0.0.1:8900/api/repair/hidden_scan?station_id=1382&year=1991"
+
 # 修复 2020-12-24 的坏值：默认 auto（逐指标自动选最优法），最近 12 站
 curl "http://127.0.0.1:8900/api/repair/daily?station_id=1124&date=2020-12-24"
 
@@ -245,7 +249,7 @@ curl "http://127.0.0.1:8900/api/repair/daily?station_id=1124&date=2020-07-03&met
 weather_api/
 ├─ data.py       查询层：纯函数，不依赖 HTTP。网站后端可直接 import
 ├─ main.py       FastAPI 路由层：参数校验 → 调 data.py → JSON
-├─ test_api.py   155 项自检（python weather_api/test_api.py）
+├─ test_api.py   169 项自检（python weather_api/test_api.py）
 └─ README.md     本文档
 ```
 

@@ -1015,6 +1015,178 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
     }
 
 
+def hidden_scan(station_id, date=None, start=None, end=None, year=None,
+                metric=None, k=12, radius_km=200, sigma=1.0, spatial_sigma=6.0,
+                detail_limit=500):
+    """隐性异常扫描：找「物理范围内、但数值可疑」的值 —— 只报告，绝不自动修复。
+
+    与 repair_scan 的区别：repair_scan 只抓哨兵值（32766/999999/超物理范围/缺测），
+    本函数抓的是「看着合理但其实错了」的隐性异常，用两条互补规则（2026-11-26 注入实验：
+    210 个隐性异常，历史极值法 100% 精确/50% 检出，邻站对比 62% 精确/51% 检出，
+    两者取并集 67% 精确/62% 检出）：
+
+      record  超过本站该月历史极值（1991-2020）± sigma 个稳健标准差（1.4826×MAD）。
+              这是「知道一个地方最高值是多少再筛查」的思路 —— 零误报，但只抓超历史记录的。
+      spatial 当日值与同日邻站中位数的偏离超过 spatial_sigma 个稳健标准差（距平域，
+              已扣各自月气候基准，消除海拔/纬度系统差）—— 能抓邻站都正常、只有本站离谱的。
+
+    降水为偏态分布（气候中位数常为 0，一场暴雨 z 就爆表），故 spatial 阈值对降水更保守：
+    只有偏离超过 spatial_sigma 倍且倍数达到 5× 才报，避免把真暴雨误报。
+
+    返回 {station, period, rules, summary, suspects[]}，每条 suspect 含
+    {date, metric, value, rules[], confidence, detail{...}}，confidence=high 表示两条规则
+    都命中（最可信），medium 表示单条命中（需人工确认）。"""
+    sid = int(station_id)
+    info = station_detail(sid)
+    if info is None:
+        raise ValueError("站点 %d 不存在" % sid)
+    d1, d2 = _resolve_range(date, start, end, year)
+    ms = [metric] if metric else list(PHYS_RANGE.keys())
+    for m in ms:
+        if not metric_ok(m):
+            raise ValueError("metric 必须是 %s" % ", ".join(METRICS))
+
+    cols = ", ".join(ms)
+    # 1) 目标站区间原始值
+    tgt = _df(f"""SELECT strftime(date_true, '%Y-%m-%d') AS d, {cols}
+                 FROM weather_hist
+                 WHERE station_id = {sid} AND date_true BETWEEN DATE '{d1}' AND DATE '{d2}'
+                 ORDER BY date_true""")
+    if tgt.empty:
+        return {"station": {"station_id": sid, "station_name": info.get("station_name")},
+                "period": {"from": d1, "to": d2}, "rules": ["record", "spatial"],
+                "summary": {"days": 0, "suspects": 0, "by_metric": {}, "by_rule": {}},
+                "suspects": []}
+    tgt["d"] = tgt["d"].astype(str).str.slice(0, 10)
+    tdt = pd.to_datetime(tgt["d"])
+    tmo = tdt.dt.month.to_numpy()
+
+    # 2) 训练期（1991-2020）逐月历史极值 + 稳健标准差（1.4826×MAD）
+    tr = _df(f"""SELECT month(date_true) AS mo, {cols} FROM weather_hist
+                 WHERE station_id = {sid} AND year(date_true) BETWEEN 1991 AND 2020""")
+    clim = {}
+    for m in ms:
+        v = pd.to_numeric(tr[m], errors="coerce")
+        lo, hi = PHYS_RANGE[m]
+        ok = tr.loc[(v >= lo) & (v <= hi), ["mo"]].copy()
+        ok[m] = v[(v >= lo) & (v <= hi)]
+        if ok.empty:
+            clim[m] = None
+            continue
+        g = ok.groupby("mo")[m]
+        med = g.median()
+        mad = g.apply(lambda x: (x - x.median()).abs().median())
+        sd = (1.4826 * mad).replace(0, np.nan)
+        gmed, gmad = ok[m].median(), 1.4826 * (ok[m] - ok[m].median()).abs().median()
+        med = med.reindex(range(1, 13)).fillna(gmed)
+        sd = sd.reindex(range(1, 13)).fillna(gmad if gmad > 0 else 1.0)
+        clim[m] = {"lo": g.min().reindex(range(1, 13)).fillna(ok[m].min()),
+                   "hi": g.max().reindex(range(1, 13)).fillna(ok[m].max()),
+                   "med": med, "sd": sd}
+
+    # 3) 邻站同日值（距平域对比用）
+    nb = stations_near(info["latitude"], info["longitude"], radius_km=radius_km, limit=int(k) + 4)
+    nb = nb[nb["station_id"] != sid].head(int(k))
+    nbmeta = {int(r["station_id"]): {"name": str(r["station_name"]),
+                                     "km": float(r["distance_km"])} for _, r in nb.iterrows()}
+    nb_ids = list(nbmeta)
+    nbm = {}
+    if nb_ids:
+        nq = _df(f"""SELECT station_id, strftime(date_true, '%Y-%m-%d') AS d, {cols}
+                     FROM weather_hist
+                     WHERE station_id IN ({','.join(map(str, nb_ids))})
+                       AND date_true BETWEEN DATE '{d1}' AND DATE '{d2}'""")
+        nq["d"] = nq["d"].astype(str).str.slice(0, 10)
+        for m in ms:
+            v = pd.to_numeric(nq[m], errors="coerce")
+            lo, hi = PHYS_RANGE[m]
+            v[(v < lo) | (v > hi)] = np.nan
+            nq[m] = v
+            nbm[m] = nq.groupby("d")[m].median()
+
+    # 4) 逐日逐指标套用两条规则
+    suspects = []
+    by_metric = {m: 0 for m in ms}
+    by_rule = {"record": 0, "spatial": 0, "both": 0}
+    for i, row in tgt.iterrows():
+        d = row["d"]
+        mo = int(tmo[i])
+        for m in ms:
+            v = row[m]
+            if pd.isna(v):
+                continue
+            v = float(v)
+            lo, hi = PHYS_RANGE[m]
+            if v < lo or v > hi:      # 超物理范围的归 repair_scan 管，这里不重复
+                continue
+            c = clim.get(m)
+            if c is None:
+                continue
+            sd = float(c["sd"].get(mo, 1.0))
+            if not np.isfinite(sd) or sd <= 0:
+                sd = 1.0
+            rules, detail = [], {}
+            # 规则1：超本站该月历史极值 ± sigma×稳健标准差
+            rec_lo = float(c["lo"].get(mo)) - sigma * sd
+            rec_hi = float(c["hi"].get(mo)) + sigma * sd
+            if v > rec_hi or v < rec_lo:
+                rules.append("record")
+                detail["record"] = {"month": mo, "hist_min": round(float(c["lo"].get(mo)), 2),
+                                    "hist_max": round(float(c["hi"].get(mo)), 2),
+                                    "limit": [round(rec_lo, 2), round(rec_hi, 2)]}
+            # 规则2：与同日邻站中位偏离（降水用倍数法更保守）
+            if m in nbm and d in nbm[m].index:
+                nmed = float(nbm[m].loc[d])
+                if np.isfinite(nmed):
+                    if m == "precipitation":
+                        dev = abs(v - nmed)
+                        if dev >= spatial_sigma * sd and max(v, nmed) / max(min(v, nmed), 0.1) >= 5:
+                            rules.append("spatial")
+                            detail["spatial"] = {"neighbor_median": round(nmed, 2),
+                                                 "ratio": round(max(v, nmed) / max(min(v, nmed), 0.1), 2)}
+                    else:
+                        if abs(v - nmed) >= spatial_sigma * sd:
+                            rules.append("spatial")
+                            detail["spatial"] = {"neighbor_median": round(nmed, 2),
+                                                 "deviation": round(v - nmed, 2)}
+            if not rules:
+                continue
+            confidence = "high" if len(rules) == 2 else "medium"
+            for r in rules:
+                by_rule[r] += 1
+            if len(rules) == 2:
+                by_rule["both"] += 1
+            by_metric[m] += 1
+            # 邻站明细（用了哪些站的数据判断）
+            used = []
+            if nb_ids:
+                nq2 = _df(f"""SELECT station_id, {m} AS v FROM weather_hist
+                              WHERE station_id IN ({','.join(map(str, nb_ids))})
+                                AND strftime(date_true, '%Y-%m-%d') = '{d}'""")
+                for _, nr in nq2.iterrows():
+                    nv = nr["v"]
+                    if pd.notna(nv) and PHYS_RANGE[m][0] <= nv <= PHYS_RANGE[m][1]:
+                        s = int(nr["station_id"])
+                        used.append({"station_id": s, "station_name": nbmeta[s]["name"],
+                                     "distance_km": nbmeta[s]["km"], "value": round(float(nv), 2)})
+                used.sort(key=lambda x: x["distance_km"])
+            suspects.append({"date": d, "metric": m, "value": round(v, 2),
+                             "rules": rules, "confidence": confidence,
+                             "detail": detail, "neighbors": used})
+        if len(suspects) >= int(detail_limit):
+            break
+    suspects.sort(key=lambda x: (x["date"], x["metric"]))
+    return {
+        "station": {"station_id": sid, "station_name": info.get("station_name"),
+                    "province": info.get("province")},
+        "period": {"from": d1, "to": d2},
+        "rules": ["record", "spatial"],
+        "summary": {"days": len(tgt), "suspects": len(suspects),
+                    "by_metric": by_metric, "by_rule": by_rule},
+        "suspects": suspects[:int(detail_limit)],
+    }
+
+
 def repair_daily(station_id, date=None, start=None, end=None, year=None,
                  metrics=None, method="auto", k=12, radius_km=300, detail_limit=500,
                  allow_climate_fill=True, max_gap_days=7):

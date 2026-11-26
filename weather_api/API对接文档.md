@@ -442,6 +442,40 @@
 
 返回 `data`：`{station, period, summary{days, rows_present, inconsistent_maxmin, per_metric}, bad_rows[{date, values, problems}], bad_rows_shown}`。
 
+#### `GET /api/repair/hidden_scan` ★ 隐性异常发现（只报不修）
+补 `repair/scan` 的盲区：后者只看物理范围，只能抓 32766/999999 这类哨兵值；本接口找**数值在合法范围内、但疑似错误**的隐性异常（例如某天温度被错记成 5℃ 而不是 15℃）。两条互补规则：
+
+| 规则 | 依据 | 特点 |
+|---|---|---|
+| `record` | 超过本站该月 1991–2020 历史极值 ± `sigma`×稳健标准差（1.4826×MAD） | 零误报（报出来基本就是问题），但只抓超历史记录的 |
+| `spatial` | 与同日邻站中位数偏离超 `spatial_sigma`×稳健标准差（降水用倍数法避免把真暴雨误报） | 能抓「邻站都正常、只有本站离谱」的情况 |
+
+参数：
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `station_id` | int | 必填 | |
+| `date` / `start` / `end` / `year` | — | — | 四选一定区间 |
+| `metric` | str | 全部 | 只查一个指标（7 选 1） |
+| `k` | int | 12 | 参与空间对比的邻站数（1~32） |
+| `radius_km` | float | 200 | 邻站搜索半径 km |
+| `sigma` | float | 1.0 | 历史极值法的容差（稳健标准差倍数，0~10） |
+| `spatial_sigma` | float | 6.0 | 空间偏离阈值（稳健标准差倍数） |
+| `detail_limit` | int | 500 | 最多返回疑似条数（1~100000） |
+
+返回 `data`：`{station, period, rules, summary{days, suspects, by_metric, by_rule}, suspects[]}`。
+每条 `suspect`：`{date, metric, value, rules[], confidence, detail, neighbors[]}`：
+- `rules`：命中的规则（`record`/`spatial`/两者都有）
+- `confidence`：`high`=两规则都命中（最可信），`medium`=单条命中（需人工确认）
+- `detail`：各规则的判定数值（历史极值范围、邻站中位、偏离量/倍数）
+- `neighbors`：**判断时实际用到的邻站实测值**（站号/站名/距离/值）——让调用方看到依据
+
+> **只报告，绝不自动修复**。极端暴雨、大风本就是真事件（实测 1608 条降水统计极端全是真暴雨），是否当异常处理须由业务方确认。实测有效性：往干净数据注入 210 个「物理范围内但错误」的值，历史极值法 100% 精确、极值∪邻站 62% 检出。
+
+```bash
+curl "http://127.0.0.1:8900/api/repair/hidden_scan?station_id=1382&year=1991"
+```
+
 #### `GET /api/repair/daily`
 修复某站某区间的坏值。
 
