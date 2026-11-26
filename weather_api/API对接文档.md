@@ -440,12 +440,14 @@
 | `date` / `start` / `end` / `year` | — | — | 四选一定区间 |
 | `detail_limit` | int | 500 | 最多返回坏日明细行数（1~100000） |
 
-返回 `data`：`{station, period, summary{days, rows_present, inconsistent_maxmin, inconsistent_maxavg, inconsistent_avgmin, inconsistent_total, per_metric}, bad_rows[{date, values, problems}], bad_rows_shown}`。
+返回 `data`：`{station, period, summary{days, rows_present, inconsistent_maxmin, inconsistent_maxavg, inconsistent_avgmin, inconsistent_spread, inconsistent_total, per_metric}, bad_rows[{date, values, problems}], bad_rows_shown}`。
 
-> **v0.12 判据升级**：除物理范围与哨兵值外，还检查
+> **判据升级（v0.12 起，v0.13 补充日较差）**：除物理范围与哨兵值外，还检查
 > ① **温度三列自洽性**：必须满足 `min ≤ avg ≤ max`，违反的记为 `max<min`/`max<avg`/`avg<min`（全库 avg<min 有 1,660 行，旧版只查 max<min 的 8 行，这是原先最大的漏检口）；
-> ② **日照超天文上限**：日照时数 > 当天按纬度算出的可照时数 + 0.5h（全库仅 145 行，误报极低）。
-> 实测：`repair_scan(1610, year=2019)` 旧版报 0 行，新版报 250 行（该站 avg<min 全部命中）；正常站新乡 `inconsistent_total=0` 不误报。
+> ② **日较差合理性**：`avg − min` 必须在 0~25℃ 之间（全库命中 1,154 行，其中 1,132 行集中在 1610 站列互换）。新乡正常行日较差 p1=0.9 / p50=4.7 / p99=10.3 / p99.9=12.2，25℃ 阈值有充分余量；
+> ③ **日照超天文上限**：日照时数 > 当天按纬度算出的可照时数 + 0.5h（全库仅 145 行，误报极低）。
+> 实测：`repair_scan(1610, year=2019)` 旧版报 0 行，新版报 250 行（avg<min）+185 行（日较差）；
+> `repair_scan(1382, year=2021)` 抓到 2021-01-16/20/24、02-16、07-27 等 7 行的 `avg-min>25`（这些行 avg 被错记为 47/49/50/60/78℃，共同特征是当日 max=32766 缺测，全部落在旧 [-100,100] 边界内、此前完全漏检）；2019 年正常不误报。
 
 #### `GET /api/repair/hidden_scan` ★ 隐性异常发现（只报不修）
 补 `repair/scan` 的盲区：后者只看物理范围/自洽性，抓不到「数值在合法范围内但错误」的隐性异常（例如某天温度被错记成 5℃ 而不是 15℃）。三条互补规则：
