@@ -1,10 +1,10 @@
 # ---- 数据与产物（体积大 / 含内部信息，绝不提交）----
-db_mirror/
+# db_mirror/  (data is now tracked in git)
 exports/
-*.parquet
+# *.parquet  (data parquet files are now tracked)
 *.docx
 *.xlsx
-_mirror_manifest.json
+# _mirror_manifest.json  (tracked with data)
 
 # ---- 凭据 ----
 .env

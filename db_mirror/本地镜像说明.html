@@ -1,0 +1,41 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>本地镜像说明</title><style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1f2328;--mut:#656d76;--line:#d8dee4;--acc:#0969da;--ok:#1a7f37}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.65 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:30px 20px 70px}
+h1{font-size:27px;margin:0 0 8px}h2{font-size:20px;margin:34px 0 14px;padding-bottom:8px;border-bottom:2px solid var(--acc)}
+h3{font-size:16px;margin:22px 0 8px}
+.meta{color:var(--mut);font-size:13px;margin-bottom:18px}
+.cards{display:flex;gap:14px;flex-wrap:wrap;margin:16px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;min-width:170px;flex:1}
+.card .k{color:var(--mut);font-size:12px}.card .v{font-size:20px;font-weight:700;margin-top:2px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:12px 0;overflow:auto}
+table{border-collapse:collapse;width:100%;font-size:13px;background:#fff}
+th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+th{background:#eef2f6;white-space:nowrap}
+code{background:#eef1f4;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#0d1117;color:#c9d1d9;padding:13px;border-radius:8px;overflow:auto;font-size:12.5px;line-height:1.5}
+.note{background:#fff8c5;border-left:4px solid #d4a72c;padding:11px 14px;border-radius:6px;margin:14px 0}
+.ok{color:var(--ok);font-weight:700}
+</style></head><body><div class="wrap"><h1>本地镜像说明</h1><div class='meta'>数据来源：TDengine Cloud <code>test_zgy_gg_device_data</code> ＋ MySQL <code>zw_gg_1_0_0</code>　｜　抓取全程<b>只读</b>，源库未被修改　｜　生成时间 2026-11-10 13:14:22</div><div class='cards'><div class='card'><div class='k'>TDengine 气象数据</div><div class='v'>16,966,797 行</div></div><div class='card'><div class='k'>站点数（子表）</div><div class='v'>876</div></div><div class='card'><div class='k'>MySQL 表 / 行</div><div class='v'>31 / 1,749</div></div><div class='card'><div class='k'>本地占用</div><div class='v'>394.1 MB</div></div></div><div class='box'><b>校验：</b>本地 16,966,797 行 vs 服务端 16,966,797 行 → <span class='ok'>一致 ✅</span></div><h2>一、目录结构</h2><pre>D:\Android PDF\
+├─ db_mirror\
+│  ├─ tdengine\weather_data\station_&lt;id&gt;.parquet  876 个气象子表
+│  ├─ mysql\&lt;表名&gt;.parquet                        MySQL 31 张表
+│  ├─ _mirror_manifest.json                        清单
+│  └─ 本地镜像说明.md / .html
+├─ local_lab.py                                    本地查询工具（DuckDB）
+├─ mirror_dbs.py                                   镜像脚本（断点续传）
+└─ pull_db_inventory.py                            原始盘点脚本</pre><h2>二、parquet 字段说明</h2><table><thead><tr><th>列名</th><th>类型</th><th>说明</th></tr></thead><tbody><tr><td><code>ts</code></td><td>timestamp[us, UTC]</td><td>原始时间戳（UTC，与源库一致）</td></tr><tr><td><code>ts_bj</code></td><td>timestamp[us]</td><td>&lt;b&gt;北京时间&lt;/b&gt;（ts + 8h，日常分析用这个）</td></tr><tr><td><code>avg_temperature</code></td><td>double</td><td>平均气温 ℃（含哨兵值）</td></tr><tr><td><code>max_temperature</code></td><td>double</td><td>最高气温 ℃</td></tr><tr><td><code>min_temperature</code></td><td>double</td><td>最低气温 ℃</td></tr><tr><td><code>avg_humidity</code></td><td>int64</td><td>平均相对湿度 %</td></tr><tr><td><code>precipitation</code></td><td>double</td><td>降水量 mm（含天气现象编码）</td></tr><tr><td><code>avg_wind_speed</code></td><td>double</td><td>平均风速 m/s</td></tr><tr><td><code>sunshine_hours</code></td><td>double</td><td>日照时数 h</td></tr><tr><td><code>file_path</code></td><td>string</td><td>源 Excel 在 OSS 上的路径</td></tr><tr><td><code>user_id</code></td><td>int64</td><td>上传用户 ID</td></tr><tr><td><code>user_nickname</code></td><td>string</td><td>上传用户昵称</td></tr></tbody></table><div class='note'><b>注意</b>：源库子表 <code>SELECT *</code> 不返回 TAG 列（<code>station_id</code>/<code>station_code</code>/<code>uploaded_at</code>）。本地 <code>station_id</code> 由文件名 <code>station_&lt;id&gt;.parquet</code> 解析得到，<code>local_lab.py</code> 的 <code>weather</code> 视图已自动补上；站点维信息通过 <code>weather_joined</code> 关联得到。</div><h2>三、怎么用</h2><h3>命令行单条查询</h3><pre>python "D:\Android PDF\local_lab.py" -q "SELECT * FROM weather LIMIT 10"</pre><h3>交互式</h3><pre>python "D:\Android PDF\local_lab.py"
+lab&gt; SELECT station_id, count(*) n FROM weather GROUP BY 1 ORDER BY n DESC LIMIT 10;
+lab&gt; .views
+lab&gt; .cols weather_joined
+lab&gt; .quit</pre><h3>Python 里用</h3><pre>import sys; sys.path.insert(0, r'D:\Android PDF')
+import local_lab
+df = local_lab.q('SELECT province, count(*) FROM weather_joined GROUP BY 1')</pre><h3>内置视图</h3><table><thead><tr><th>视图</th><th>内容</th></tr></thead><tbody><tr><td><code>weather</code></td><td>TDengine 全部 876 个子表（1669 万行），<b>含哨兵值</b>，带 station_id</td></tr><tr><td><code>weather_ok</code></td><td>已按物理合理范围过滤哨兵/异常值，<b>做统计推荐用这个</b></td></tr><tr><td><code>stations</code></td><td>MySQL weather_station_info，909 个站点维表</td></tr><tr><td><code>weather_joined</code></td><td>weather + 站点维表关联宽表（带省/站名/经纬度/海拔）</td></tr><tr><td><code>mysql_&lt;表名&gt;</code></td><td>MySQL 31 张表逐表一个视图，如 mysql_raster_asset</td></tr></tbody></table><h2>四、重跑 / 更新镜像</h2><pre># 断点续传（已下载且行数吻合的跳过）
+python "D:\Android PDF\mirror_dbs.py"
+
+# 强制全部重拉
+python "D:\Android PDF\mirror_dbs.py" --force
+
+# 只更新 MySQL
+python "D:\Android PDF\mirror_dbs.py" --skip-td</pre></div></body></html>
