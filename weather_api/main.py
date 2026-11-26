@@ -36,7 +36,7 @@ app = FastAPI(
     title="气象数据查询 API",
     description="基于本地镜像的 1951–2025 全国 876 站逐日气象数据查询接口。"
                 "时间戳已自动修正（源库偏移 +100 年）。",
-    version="0.13.0",
+    version="0.14.0",
     default_response_class=UTF8JSONResponse,
 )
 app.add_middleware(

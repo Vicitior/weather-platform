@@ -534,5 +534,45 @@ sc19 = D.repair_scan(1382, year=2019, detail_limit=5)
 check("2019 年正常不误报日较差", sc19["summary"]["inconsistent_spread"] == 0,
       sc19["summary"]["inconsistent_spread"])
 
+print("== 30. v0.14 温度矛盾定位 + 3xxxx 降水解码 ==")
+# 30.1 三角形定位：avg 被写坏时不牵连 min（曾实测把 min=0.6℃ 误改成 -2.4℃）
+_c1 = D._locate_temp_culprit({"max_temperature": 32766.0, "avg_temperature": 60.0,
+                              "min_temperature": 0.6})
+check("max 缺测时定位坏列=avg（不牵连 min）", _c1 == "avg_temperature", _c1)
+_c2 = D._locate_temp_culprit({"max_temperature": -2.0, "avg_temperature": 30.0,
+                              "min_temperature": -8.0})
+check("max<avg 矛盾定位坏列=avg", _c2 == "avg_temperature", _c2)
+_c3 = D._locate_temp_culprit({"max_temperature": 80.0, "avg_temperature": 5.0,
+                              "min_temperature": -6.0})
+check("max 越界时定位坏列=max", _c3 == "max_temperature", _c3)
+# 30.2 8 个「范围内真错误」必须被修出来（此前 hit 恒为空、修不了）
+rr21 = D.repair_daily(1382, year=2021, detail_limit=300)
+_av = {r["date"]: r["repaired"] for r in rr21["rows"] if r["metric"] == "avg_temperature"}
+check("2021-01-16 avg 60→修出合理值", abs(_av.get("2021-01-16", 999) - 4.0) < 6, _av.get("2021-01-16"))
+check("2021-07-27 avg 78→修出合理值", _av.get("2021-07-27", 999) < 45, _av.get("2021-07-27"))
+check("2021-08-05 avg 3520→修出合理值", _av.get("2021-08-05", 999) < 45, _av.get("2021-08-05"))
+_mn = {r["date"]: r["repaired"] for r in rr21["rows"] if r["metric"] == "min_temperature"}
+check("normal min 0.6 不被当成坏值改写", "2021-01-16" not in _mn, list(_mn)[:3])
+# 30.3 降水 3xxxx 解码
+check("31021→雪 2.1mm", D.decode_precipitation(31021)[0] == 2.1, D.decode_precipitation(31021))
+check("30056→雨 5.6mm", D.decode_precipitation(30056)[0] == 5.6, D.decode_precipitation(30056))
+check("32001→露/霜 0.1mm", D.decode_precipitation(32001)[0] == 0.1, D.decode_precipitation(32001))
+check("32700→微量降水 0.05mm", D.decode_precipitation(32700)[0] == 0.05,
+      D.decode_precipitation(32700))
+check("32766→缺测（None）", D.decode_precipitation(32766)[0] is None, D.decode_precipitation(32766))
+check("普通雨量 12.3 原样返回", D.decode_precipitation(12.3)[0] == 12.3,
+      D.decode_precipitation(12.3))
+check("解码说明含中文类型", "雪" in D.decode_precipitation(31021)[1],
+      D.decode_precipitation(31021)[1])
+# 30.4 同行脏值不得污染跨要素特征（曾实测：avg=78℃ 被当正常特征 → 预测最高气温 57.7℃）
+_mx = {r["date"]: r["repaired"] for r in rr21["rows"] if r["metric"] == "max_temperature"}
+check("01-16 最高气温修复值 ≤15℃（不再被 60℃ 脏特征带偏）",
+      _mx.get("2021-01-16", 999) <= 15, _mx.get("2021-01-16"))
+check("07-27 最高气温修复值 ≤40℃（不再被 78℃ 脏特征带偏）",
+      _mx.get("2021-07-27", 999) <= 40, _mx.get("2021-07-27"))
+check("最高气温修复值不低于当日平均气温",
+      all(v >= _av.get(d, -999) - 0.6 for d, v in _mx.items() if d in _av),
+      [(d, v, _av.get(d)) for d, v in _mx.items() if d in _av and v < _av[d] - 0.6][:3])
+
 print("\n===== %d passed, %d failed =====" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

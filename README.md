@@ -18,8 +18,9 @@
 | 问题 | 具体表现 | 处理 |
 |---|---|---|
 | **时间戳整体偏移** | 源库里所有时间是 2051–2125 年（未来），实际应为 1951–2025 | 镜像时统一 `−100 年`，并修正闰日错位（见下） |
-| **哨兵值污染** | 999999 / 32766 这类"错误码"混在数值列里；降水列里塞了天气现象编码（32700 等） | 按物理范围过滤（`PHYS_RANGE`），聚合时逐指标独立过滤 |
+| **哨兵值污染** | 999999 / 32766 这类"错误码"混在数值列里；降水列用 3xxxx 复合码表示「类型+降水量」（32700=微量降水） | 按物理范围过滤（`PHYS_RANGE`），聚合时逐指标独立过滤 |
 | **缺测与异常** | 部分站整段停更（2020 年只有 161 站记满全年），部分站零星坏值 | 扫描 + 多方法修复，并标注每个修复值的可信度 |
+| **降水编码** | 3xxxx = 3 + 类型 + 降水量×0.1mm（30xxx 雨 / 31xxx 雪 / 32xxx 露霜），32700=微量降水 | decode_precipitation() 解码后参与统计，不再当错误值 |
 | **闰日错位** | `+100 年` 位移把 2000-02-29 钳到了 2100-02-28，684 站全中 | 按 `hour(ts)=12` 的相位修正回 2000-02-29 |
 
 ---
@@ -28,11 +29,11 @@
 
 ```
 weather-platform/
-├── weather_api/                  # 对外 HTTP API（v0.10.0，32 个路由）
+├── weather_api/                  # 对外 HTTP API（v0.14.0，33 个路由）
 │   ├── data.py                   # 查询层 + 修复算法（纯函数，不依赖 HTTP）
 │   ├── main.py                   # FastAPI 路由
 │   ├── export.py                 # 填报表导出 Word / Excel
-│   ├── test_api.py               # 155 项自检
+│   ├── test_api.py               # 220 项自检
 │   ├── requirements.txt
 │   ├── README.md                 # 接口文档（开发者速查）
 │   ├── API对接文档.md             # 给调用方的完整接口文档（32 个路由逐个说明）
@@ -107,7 +108,7 @@ python -m weather_api.main          # 默认 0.0.0.0:8900
 > `curl -LO https://github.com/Vicitior/weather-platform/releases/download/v1.0.0/weather-platform-db_mirror.tar.gz && tar -xzf weather-platform-db_mirror.tar.gz`
 
 打开 `http://127.0.0.1:8900/docs` 看接口，或 `GET /api/health` 确认健康。
-自检：`python weather_api/test_api.py`（155 项，几秒跑完）。
+自检：`python weather_api/test_api.py`（220 项，十几秒跑完）。
 
 ### 下面是从源库镜像的步骤（只有重新拉数据才需要）
 
@@ -158,7 +159,7 @@ python -m weather_api.main            # 默认 0.0.0.0:8900
 
 - Swagger 文档：`http://127.0.0.1:8900/docs`
 - 健康检查：`GET /api/health`
-- 自检：`python weather_api/test_api.py`（155 项）
+- 自检：`python weather_api/test_api.py`（220 项）
 
 > **注意**：必须在 `weather_api` 的**父目录**执行，且 `db_mirror/` 要和 `weather_api/` 同级
 > （或用 `WEATHER_DB_ROOT` 指向数据目录）。

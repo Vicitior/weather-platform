@@ -799,6 +799,149 @@ PHYS_STRICT = {
 _ROUND = {"avg_temperature": 1, "max_temperature": 1, "min_temperature": 1,
           # avg_humidity 源列是 BIGINT（整型），修复值若带小数回写会被截断，故取整
           "avg_humidity": 0, "precipitation": 1, "avg_wind_speed": 2, "sunshine_hours": 2}
+
+# ---------------- 降水源库编码解码（3xxxx / 32700） ----------------
+#
+# 源库降水列混用了三种写法，必须解码后再当数值用：
+#   1) 普通量            0 ~ 1000（mm，直接可用）
+#   2) 32700            微量降水 <0.1mm 的专用码（全库 1,923,044 行 / 871 站）
+#   3) 3xxxx 复合编码    3 + [类型1位] + [降水量3位, 单位 0.1mm]
+#                       30xxx = 雨、31xxx = 雪、32xxx = 露/霜（其他凝结）
+#      例：31021 → 雪 2.1mm；30056 → 雨 5.6mm；32001 → 露/霜 0.1mm
+#
+# 判据（见 ../../make_full_daily_table.py 的推导）：末3位分布呈幂律递减（0.1mm 85,968 /
+# 0.2mm 29,690 / 0.3mm 6,441 …），符合降水量而非天气现象码；31xxx 均温 -7.1℃、
+# 零下占比 81.5%、冬季占 80%（正是雪），30xxx 均温 +2.5℃、均量 6.29mm（正是雨），
+# 32xxx 均量仅 0.16mm、秋季峰、均温 13℃（正是露/霜）；且解码后与邻站降水的相关系数
+# 达 0.705（30xxx）/ 0.814（31xxx），若是现象码不可能有这种量级相关。
+# 反证：若把 32700 按 3+2+700 解成 70.0mm，新乡年均降水会从 585mm 变成 3,034mm。
+PRECIP_SENTINELS = (32766.0, 999990.0, 999998.0, 999999.0)
+PRECIP_TYPE = {30: "雨", 31: "雪", 32: "露/霜"}
+PRECIP_MICRO = 32700.0          # 微量降水专用码，按 0.05mm 计
+
+
+def decode_precipitation(v):
+    """把源库降水值解码成 (mm, 说明)。
+
+    mm=None 表示缺测/无法解码；说明是给表里「天气电码」列看的中文解释。
+    普通数值原样返回（说明为 None）。
+    """
+    if v is None:
+        return None, None
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return None, None
+    if not (fv == fv) or fv in (float("inf"), float("-inf")):   # NaN / inf
+        return None, None
+    if fv in PRECIP_SENTINELS:
+        return None, "缺测（源库占位 %d）" % int(fv)
+    if fv == PRECIP_MICRO:
+        return 0.05, "微量降水（源库码 32700，<0.1mm，按 0.05mm 计）"
+    if 30000.0 <= fv < 32700.0:
+        typ = int(fv) // 1000
+        amt = round((int(fv) % 1000) / 10.0, 1)
+        return amt, "%s %.1fmm（源库码 %d）" % (PRECIP_TYPE.get(typ, "未知"), amt, int(fv))
+    if 0.0 <= fv <= 1000.0:
+        return fv, None
+    return None, "超出合理范围（%g）" % fv
+
+
+# 温度三列的源库缺测占位：这些不是观测值，不参与「谁把温度关系搞乱」的推理。
+TEMP_SENTINELS = (32766.0, 999998.0, 999999.0, 999990.0, 32700.0)
+
+
+def _locate_temp_culprit(v):
+    """在 max/avg/min 三列里定位最可疑的那一列（温度矛盾时决定改谁）。
+
+    为什么需要它：温度自洽性判据（max<min / max<avg / avg<min / 日较差过大）
+    说的是一组关系不成立，但**不能把参与的三列全当坏值**。例如
+    avg=60℃、min=0.6℃、max=32766（缺测）：矛盾来自 avg 被写坏，
+    若连 min 一起改会把 0.6℃ 这个好观测毁掉（实测曾被改成 -2.4℃）。
+
+    判定顺序：
+      0) 先剔除源库缺测占位（32766 等），它们已由 out_of_range 单独报出；
+      1) 若恰好只有一列越过 PHYS_STRICT 合理性边界 → 就是它；
+      2) 否则用三角形关系（正常日 avg ≈ (max+min)/2）取偏差最大的一列。
+    """
+    mx = v.get("max_temperature")
+    av = v.get("avg_temperature")
+    mn = v.get("min_temperature")
+    clean = {}
+    for k, val in (("max_temperature", mx), ("avg_temperature", av),
+                   ("min_temperature", mn)):
+        try:
+            clean[k] = None if (val is not None and float(val) in TEMP_SENTINELS) else val
+        except (TypeError, ValueError):
+            clean[k] = None
+    mx, av, mn = clean["max_temperature"], clean["avg_temperature"], clean["min_temperature"]
+
+    # 优先级 1：恰好一列越过 PHYS_STRICT 合理性边界 → 一定是它坏（即使三列关系恰好自洽，
+    # 例如 max=80℃ 配 avg=5/min=-6 关系成立但 80℃ 本身不可能）。
+    over = [k for k, val in (("max_temperature", mx), ("avg_temperature", av),
+                             ("min_temperature", mn))
+            if val is not None and not (PHYS_STRICT[k][0] <= val <= PHYS_STRICT[k][1])]
+    if len(over) == 1:
+        return over[0]
+
+    # 三列本来就自洽 → 没有坏列可归因，返回 None（调用方不会把整行都当坏值）
+    def _triple_fine():
+        bits = []
+        if mx is not None and mn is not None:
+            bits.append(mx >= mn)
+        if mx is not None and av is not None:
+            bits.append(av <= mx + 0.5)
+        if av is not None and mn is not None:
+            bits.append(-0.5 <= (av - mn) <= 25.0)
+        return all(bits) if bits else False
+
+    if _triple_fine():
+        return None
+
+    # 优先级 2：留一法自洽检验 —— 去掉哪一列后，剩下两列的关系成立，哪一列就是坏列。
+    # 这比「三角形偏差最大」可靠：max=-2 / avg=30 / min=-8 时三角偏差 max 与 min 并列
+    # 最大（都是 70），会误选 max；但去掉 avg 后 max(-2) > min(-8)、日较差 6℃ 完全自洽。
+    def _pair_ok(ka, va, kb, vb):
+        pair = {ka: va, kb: vb}
+        if "max_temperature" in pair and "min_temperature" in pair and len(pair) == 2:
+            return pair["max_temperature"] >= pair["min_temperature"]
+        if "max_temperature" in pair and "avg_temperature" in pair:
+            return pair["avg_temperature"] <= pair["max_temperature"] + 0.5
+        if "avg_temperature" in pair and "min_temperature" in pair:
+            sp = pair["avg_temperature"] - pair["min_temperature"]
+            return -0.5 <= sp <= 25.0
+        return True
+
+    vals3 = {"max_temperature": mx, "avg_temperature": av, "min_temperature": mn}
+    solos = []
+    for drop in ("max_temperature", "avg_temperature", "min_temperature"):
+        rest = [(k, v) for k, v in vals3.items() if k != drop and v is not None]
+        if len(rest) == 2 and _pair_ok(rest[0][0], rest[0][1], rest[1][0], rest[1][1]):
+            solos.append(drop)
+    if len(solos) == 1:
+        return solos[0]
+
+    # 优先级 3：三角形关系兜底（正常日 avg ≈ (max+min)/2）
+    cand = []
+    if mx is not None and av is not None and mn is not None:
+        cand = [("max_temperature", abs(mx - (2 * av - mn))),
+                ("min_temperature", abs(mn - (2 * av - mx))),
+                ("avg_temperature", abs(av - (mx + mn) / 2.0))]
+    elif av is not None and mn is not None:
+        # 没有 max 时无法三角定位；日较差类矛盾绝大多数是 avg 被写坏
+        # （新乡 2021 那 7 行全部是 avg 被填入了乱码值）
+        cand = [("avg_temperature", abs(av - mn))]
+    elif mx is not None and av is not None:
+        cand = [("avg_temperature", abs(mx - av))]
+    if not cand:
+        return None
+    if over:
+        cand = [c for c in cand if c[0] in over]
+    if solos:
+        cand = [c for c in cand if c[0] in solos]
+    cand.sort(key=lambda x: -x[1])
+    return cand[0][0]
+
 REPAIR_METHODS = ("auto", "own6", "clima", "blend", "krig", "idw", "alt_idw", "nearest")
 LAPSE_RATE = 0.0065  # 温度海拔直减率 ℃/m
 
@@ -1379,13 +1522,58 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
     scan = repair_scan(sid, date=date, start=start, end=end, year=year,
                        detail_limit=max(int(detail_limit), 100000))
     d1, d2 = scan["period"]["from"], scan["period"]["to"]
+    # 非「指标:问题」形式的问题 → 受影响的指标。
+    # 温度三列自洽性与日较差、日照天文上限这三类判据输出的是不带指标前缀的短语
+    # （如 "avg-min>25（日较差不可能）"、"max<avg"、"sunshine>daylength"），
+    # 旧版只认 "指标:问题" 的写法，导致这些日子的 hit 恒为空、永远修不了 ——
+    # 典型受害者是新乡 2021-01-16（avg=60℃），扫描能报出来却不会插补。
+    #
+    # ⚠ 但绝不能把「参与矛盾的所有列」都当坏值：例如 avg=60℃ / min=0.6℃ 时日较差
+    #    矛盾是 avg 的问题，若连 min 一起改会把好观测（0.6℃）毁掉。
+    #    定位逻辑统一放在模块级 _locate_temp_culprit()，这里直接复用。
+    def _culprit_temp(v):
+        return _locate_temp_culprit(v)
+
+    _TEMPK = ("max_temperature", "avg_temperature", "min_temperature")
+
+    def _problems_to_metrics(problems, allowed, values):
+        got = set()
+        tv = {k: values.get(k) for k in _TEMPK}
+        for p in problems:
+            if ":" in p:
+                m = p.split(":", 1)[0]
+                if m in allowed:
+                    got.add(m)
+            elif p.startswith("sunshine>daylength"):
+                if "sunshine_hours" in allowed:
+                    got.add("sunshine_hours")
+            elif p.startswith(("max<min", "max<avg", "avg<min", "avg-min>25", "avg-min<-5")):
+                c = _culprit_temp(tv)
+                if c in allowed:
+                    got.add(c)
+        return sorted(got)
+
+    # 不带指标前缀的判据 → 中文短语（写进 problem 列给人看）
+    _PLAIN = (("max<min", "最高气温低于最低气温（不可能）"),
+              ("max<avg", "最高气温低于平均气温（不可能）"),
+              ("avg<min", "平均气温低于最低气温（不可能）"),
+              ("avg-min>25", "日较差过大（>25℃），平均气温与最低气温不可能差这么多"),
+              ("avg-min<-5", "日较差为负（平均气温低于最低气温），数据颠倒"),
+              ("sunshine>daylength", "日照时数超过天文可照时数（不可能）"))
+
+    def _first_plain_problem(probs, m):
+        """为某指标挑一条最能解释它的中文判据（只用于 problem 列的可读展示）。"""
+        for key, txt in _PLAIN:
+            if any(p.startswith(key) for p in probs):
+                return txt
+        return "异常（判据未给出具体说明）"
+
     bad = []
     for row in scan["bad_rows"]:
         if "row_missing" in row["problems"]:
             hit = list(ms)
         else:
-            hit = sorted({p.split(":", 1)[0] for p in row["problems"]
-                          if ":" in p and p.split(":", 1)[0] in ms})
+            hit = _problems_to_metrics(row["problems"], set(ms), row["values"])
         if hit:
             # 统一成 YYYY-MM-DD（pandas 读出的 date 列可能是 'YYYY-MM-DD HH:MM:SS' 字符串，
             # 而 _shift()/vals 的 key 是短格式，不一致会导致时间维永远匹配不上）
@@ -1771,8 +1959,15 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
         _own6_cache[m] = (w, mu, sd, cl, nb_cols, nb_ids)
         return _own6_cache[m]
 
-    def own6_predict(m, dstr):
-        """门控跨要素回归：其它要素足够多才启用，否则返回 None（由调用方退回 clima）。"""
+    def own6_predict(m, dstr, bad_set=None):
+        """门控跨要素回归：其它要素足够多才启用，否则返回 None（由调用方退回 clima）。
+
+        bad_set = 该日已被判为「有错、待修」的指标集合。这些列虽然可能落在
+        PHYS_RANGE 宽边界内（例如 avg_temperature=78℃），但**不能当正常观测喂进特征**
+        —— 否则模型会把错值的影响传出去。实测踩过：新乡 2021-07-27 修最高气温时，
+        avg=78℃ 被当成有效特征，预测出 57.7℃ 这种不可能的高温；排除后恢复正常。
+        """
+        bad_set = bad_set or set()
         month = int(dstr[5:7])
         if m in OWN6_UNSUITED:
             return None, None, ("%s 属间断非高斯变量，跨要素岭回归实测更差"
@@ -1782,7 +1977,7 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
             return None, None, "目标站当日无记录行，跨要素特征不可得"
         n_other = 0
         for mm in PHYS_RANGE:
-            if mm == m:
+            if mm == m or mm in bad_set:
                 continue
             v = cur.get(mm)
             if v is not None and PHYS_RANGE[mm][0] <= v <= PHYS_RANGE[mm][1]:
@@ -1808,7 +2003,8 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
             if mm == m:
                 continue
             v = cur.get(mm)
-            if v is None or not (PHYS_RANGE[mm][0] <= v <= PHYS_RANGE[mm][1]):
+            # bad_set 里的列一律当「缺」处理（与训练期缺失时的 0.0 距平同处理）
+            if mm in bad_set or v is None or not (PHYS_RANGE[mm][0] <= v <= PHYS_RANGE[mm][1]):
                 f.append(0.0)
                 continue
             if mm == "precipitation":                   # 与训练期一致：log1p 空间
@@ -1872,12 +2068,21 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
                                 "adjusted": round(adj, 3), "weight": round(wgt, 6)})
                 if meth == "nearest":
                     break
-            prob = ("row_missing" if "row_missing" in probs else
-                    m + ":" + next(p.split(":", 1)[1] for p in probs if p.startswith(m + ":")))
+            # problem 文案：优先用「指标:问题」原样，否则（自洽性/日较差/日照上限这类
+            # 不带指标前缀的判据）取第一条相关判据的中文短语
+            if "row_missing" in probs:
+                prob = "row_missing"
+            else:
+                _p = next((p.split(":", 1)[1] for p in probs if p.startswith(m + ":")), None)
+                if _p is None:
+                    _p = _first_plain_problem(probs, m)
+                prob = m + ":" + _p
 
             # --- 出值 ---
             if meth == "own6":
-                ov, n_other, owhy = own6_predict(m, dstr)
+                # 把「这一行里已知有错的其它指标」也排除掉，否则错值会污染跨要素特征
+                _badset = set(hit_ms) - {m}
+                ov, n_other, owhy = own6_predict(m, dstr, _badset)
                 if ov is not None:
                     # 跨要素回归用到了目标站自身的其它要素 + 全部邻站的 7 要素，
                     # contributors 只作可读性展示（模型权重不可直接换算成单站贡献）。
