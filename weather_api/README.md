@@ -1,4 +1,4 @@
-# 气象数据查询 API
+﻿# 气象数据查询 API
 
 基于本地镜像（`db_mirror/`）的 1951–2025 全国 876 站逐日气象数据查询接口。
 **离线可用**（不连任何数据库），之后可原样搬上网站（换个数据源即可）。
@@ -254,7 +254,7 @@ curl "http://127.0.0.1:8900/api/repair/daily?station_id=1124&date=2020-07-03&met
 weather_api/
 ├─ data.py       查询层：纯函数，不依赖 HTTP。网站后端可直接 import
 ├─ main.py       FastAPI 路由层：参数校验 → 调 data.py → JSON
-├─ test_api.py   203 项自检（python weather_api/test_api.py）
+├─ test_api.py   228 项自检（python weather_api/test_api.py）
 └─ README.md     本文档
 ```
 

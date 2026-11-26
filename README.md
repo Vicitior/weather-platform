@@ -1,4 +1,4 @@
-# 气象数据平台 · weather-platform
+﻿# 气象数据平台 · weather-platform
 
 把一套**气象站点时序数据**（876 站 × 1951–2025 逐日 × 7 个要素，约 1700 万行）从云端数据库
 镜像到本地、做质量体检、识别并修复异常/缺测，并对外提供一套完整的中文气象查询 HTTP API。
@@ -29,11 +29,11 @@
 
 ```
 weather-platform/
-├── weather_api/                  # 对外 HTTP API（v0.14.0，33 个路由）
+├── weather_api/                  # 对外 HTTP API（v0.16.0，33 个路由）
 │   ├── data.py                   # 查询层 + 修复算法（纯函数，不依赖 HTTP）
 │   ├── main.py                   # FastAPI 路由
 │   ├── export.py                 # 填报表导出 Word / Excel
-│   ├── test_api.py               # 220 项自检
+│   ├── test_api.py               # 228 项自检
 │   ├── requirements.txt
 │   ├── README.md                 # 接口文档（开发者速查）
 │   ├── API对接文档.md             # 给调用方的完整接口文档（32 个路由逐个说明）
@@ -108,7 +108,7 @@ python -m weather_api.main          # 默认 0.0.0.0:8900
 > `curl -LO https://github.com/Vicitior/weather-platform/releases/download/v1.0.0/weather-platform-db_mirror.tar.gz && tar -xzf weather-platform-db_mirror.tar.gz`
 
 打开 `http://127.0.0.1:8900/docs` 看接口，或 `GET /api/health` 确认健康。
-自检：`python weather_api/test_api.py`（220 项，十几秒跑完）。
+自检：`python weather_api/test_api.py`（228 项，十几秒跑完）。
 
 ### 下面是从源库镜像的步骤（只有重新拉数据才需要）
 
@@ -159,7 +159,7 @@ python -m weather_api.main            # 默认 0.0.0.0:8900
 
 - Swagger 文档：`http://127.0.0.1:8900/docs`
 - 健康检查：`GET /api/health`
-- 自检：`python weather_api/test_api.py`（220 项）
+- 自检：`python weather_api/test_api.py`（228 项）
 
 > **注意**：必须在 `weather_api` 的**父目录**执行，且 `db_mirror/` 要和 `weather_api/` 同级
 > （或用 `WEATHER_DB_ROOT` 指向数据目录）。
