@@ -54,9 +54,19 @@ def err(msg, code=400):
 
 @app.exception_handler(Exception)
 async def unhandled(request, exc):
+    """兜底异常处理：把参数类错误映射为 400，避免把客户端输入问题误报为 500。
+
+    上游 duckdb 的日期/数值解析失败（ConversionException / Invalid Input 等）本质是
+    用户传了非法日期或数值，属于 400 Bad Request；真正的服务内部错误才用 500。
+    """
     traceback.print_exc()
-    return UTF8JSONResponse({"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)},
-                            status_code=500)
+    name = type(exc).__name__
+    msg = "%s: %s" % (name, exc)
+    # 客户端输入错误 → 400；其余才是服务端 500
+    client_errors = ("ConversionException", "InvalidInputException", "ValueError",
+                     "TypeError", "ParserException", "BinderException")
+    code = 400 if any(k in name for k in client_errors) else 500
+    return UTF8JSONResponse({"ok": False, "error": msg}, status_code=code)
 
 
 @app.get("/", include_in_schema=False)
