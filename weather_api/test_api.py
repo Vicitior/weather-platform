@@ -226,13 +226,14 @@ meth_used = {x["metric"]: x["method"] for x in ra["rows"]}
 check("整行坏日退回 clima", meth_used.get("avg_temperature") == "clima", meth_used)
 check("整行坏日退回 clima（最高）", meth_used.get("max_temperature") == "clima", meth_used)
 rs = [x for x in ra["rows"] if x["metric"] == "sunshine_hours"]
-check("单指标坏日走 own6", len(rs) == 1 and rs[0]["method"] == "own6",
+# v0.16 起 BEST_METHOD 按 8 站真实遮蔽审计修正：日照改回 clima（own6 只赢 1/8 站）。
+check("单指标坏日按新选型走 clima（日照）", len(rs) == 1 and rs[0]["method"] == "clima",
       rs[0]["method"] if rs else "")
 check("退回原因写明门控", any("门控" in (x.get("note") or "")
                               for x in ra["rows"] if x["method"] == "clima"),
       [x.get("note") for x in ra["rows"] if x["method"] == "clima"][:1])
 check("2020-07-03 日照被修复", len(rs) == 1 and rs[0]["repaired"] is not None, rs)
-check("own6 标注跨要素回归", len(rs) == 1 and "跨要素岭回归" in rs[0].get("note", ""),
+check("日照降级走时间维", len(rs) == 1 and "时间维" in (rs[0].get("note") or ""),
       rs[0].get("note") if rs else "")
 check("日照修复值 5~20h", len(rs) == 1 and 5 <= rs[0]["repaired"] <= 20,
       rs[0]["repaired"] if rs else "")
@@ -401,6 +402,13 @@ check("门控是按指标的字典", isinstance(D.OWN6_GATE, dict), type(D.OWN6_
 check("门控层数都在 1~6", all(1 <= v <= 6 for v in D.OWN6_GATE.values()), D.OWN6_GATE)
 check("auto 选型气温用 own6", D.BEST_METHOD["avg_temperature"] == "own6", D.BEST_METHOD)
 check("auto 选型降水用 clima", D.BEST_METHOD["precipitation"] == "clima", D.BEST_METHOD)
+# v0.16：8 站真实遮蔽审计（exports/_own6_audit.json）后修正选型 ——
+# 剔除列互换污染站（盐源 1610）后：气温三件套 + 风速用 own6，湿度与日照回落 clima。
+check("auto 选型风速用 own6", D.BEST_METHOD["avg_wind_speed"] == "own6", D.BEST_METHOD)
+check("auto 选型最高气温用 own6", D.BEST_METHOD["max_temperature"] == "own6", D.BEST_METHOD)
+check("auto 选型最低气温用 own6", D.BEST_METHOD["min_temperature"] == "own6", D.BEST_METHOD)
+check("auto 选型湿度回落 clima", D.BEST_METHOD["avg_humidity"] == "clima", D.BEST_METHOD)
+check("auto 选型日照回落 clima", D.BEST_METHOD["sunshine_hours"] == "clima", D.BEST_METHOD)
 # 显式指定 own6：单指标坏的行必须真的走 own6
 ro = D.repair_daily(1124, date="2020-07-03", method="own6")
 sun = [r for r in ro["rows"] if r["metric"] == "sunshine_hours"]

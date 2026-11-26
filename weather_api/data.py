@@ -1034,10 +1034,26 @@ OWN6_ALPHA = 3.0
 #   blend = 0.5*clima + 0.5*前后日距平（引入时间连续性）
 #   krig  = 距平克里金（第四轮：气温/日照/风速显著优于 clima 但仅约 5%，
 #           代价是多查一次 30 年长序列，故不进 auto 默认，需显式指定）
+#
+#   ⚠ 2026-11-26 八站真实遮蔽审计（exports/_own6_audit.json、_own6_audit_clean.json）：
+#     8 个不同气候区站点（新乡/乌鲁木齐/漠河/吐鲁番/郑州/盐源/哈密/喀什）
+#     2016-2019 年各 30 点/指标真实遮蔽后重建，own6 与 clima 逐点对照。
+#     ⚠ 必须先剔除数据污染站：盐源 1610 在 2014-2020 年 avg_temperature 与
+#       avg_wind_speed 整列互换（ta 年均 2~3℃、ws 年均 12~13 m/s，正常应是 12℃/2m/s），
+#       用它算出来的 own6 误差（最高气温 +9.86℃）完全是脏数据造成的假象。
+#     剔除盐源后剩 7 站（exports/_own6_audit_clean.json）：
+#        avg_temperature  own6 赢 7/7，平均 ΔMAE −0.70℃  → own6
+#        max_temperature  own6 赢 5/7，平均 Δ−0.10℃       → own6
+#        min_temperature  own6 赢 6/7，平均 Δ−0.52℃       → own6
+#        avg_humidity     own6 赢 2/7，平均 Δ+1.34%       → clima
+#        precipitation    两者完全相同（own6 本就不适用）  → clima
+#        avg_wind_speed   own6 赢 3/7，平均 Δ−0.04m/s     → own6（边际）
+#        sunshine_hours   own6 赢 1/7，平均 Δ+0.59h       → clima
+#     结论：气温三件套 + 风速用 own6，湿度与日照回落 clima。
 BEST_METHOD = {
     "avg_temperature": "own6", "max_temperature": "own6", "min_temperature": "own6",
-    "avg_humidity": "own6", "precipitation": "clima",
-    "avg_wind_speed": "own6", "sunshine_hours": "own6",
+    "avg_humidity": "clima", "precipitation": "clima",
+    "avg_wind_speed": "own6", "sunshine_hours": "clima",
 }
 # krig 不适用的指标（降水为间断非高斯事件，加性克里金实测显著更差 → 自动退回 clima）
 KRIG_UNSUITED = ("precipitation",)
@@ -2107,12 +2123,23 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
         for mm in PHYS_RANGE:                           # 与训练期同序：按要素、按邻站
             if mm == m:
                 continue
-            df = nb_cols[mm]
-            if dstr in df.index:
-                row = df.loc[dstr].to_numpy(dtype=float)
-                f.extend([0.0 if not np.isfinite(x) else float(x) for x in row])
-            else:
-                f.extend([0.0] * len(nb_ids))
+            # ⚠ 历史 bug（2026-11-26 发现并修复）：原先查 _own6_shared() 构造的 nb_cols[mm]，
+            # 那张表的索引只有**训练期 1991-2005** 的日期；修 2016 年数据时 dstr 不在索引里，
+            # 邻站特征整段被填成 0.0 → own6 退化成「只用本站其它要素 + 常数坐标」。
+            # 实测新乡 40 个遮蔽点气温 MAE 1.75℃（比 clima 的 0.78℃ 差一倍多）。
+            # 这里改为按预测日现算：邻站当日值 − 该站该月气候基准（用训练期同一套 cl，
+            # 保证与训练特征同尺度），训练期外也能拿到真实邻站信号。
+            mi_nb = met_idx[mm]
+            for nid in nb_ids:
+                nv = vals.get((nid, dstr), {}).get(mm)
+                if nv is None or not (PHYS_RANGE[mm][0] <= nv <= PHYS_RANGE[mm][1]):
+                    f.append(0.0)
+                    continue
+                if mm == "precipitation":                # 与训练期一致：log1p 空间
+                    nv = math.log1p(max(nv, 0.0))
+                row_c = cl.get((int(nid), month))
+                b_nb = float(row_c[mi_nb]) if row_c is not None else np.nan
+                f.append(float(nv - b_nb) if np.isfinite(b_nb) else 0.0)
         f.extend([float(lat) / 50.0, float(lng) / 100.0,
                   math.sin(2 * math.pi * month / 12.0), math.cos(2 * math.pi * month / 12.0)])
         f = np.asarray(f, dtype=float)
