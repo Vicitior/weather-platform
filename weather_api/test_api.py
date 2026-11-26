@@ -22,7 +22,8 @@ def check(name, cond, detail=""):
 
 print("== 1. 概览 ==")
 ov = D.overview()
-check("行数=哨兵过滤后 14,420,774", int(ov["rows_total"]) == 14420774, ov)
+check("行数=可用行 16,666,901（降水编码值不再被当哨兵）",
+      int(ov["rows_total"]) == 16666901, ov)
 check("站点 876", int(ov["stations"]) == 876, ov)
 check("时间从 1951", str(ov["date_from"]).startswith("1951"), ov)
 check("时间到 2025", str(ov["date_to"]).startswith("2025"), ov)
@@ -288,12 +289,20 @@ check("krig 贡献站有权重", all("weight" in c for c in k_temp["contributors
 check("krig 权重和为 1", abs(sum(c["weight"] for c in k_temp["contributors"]) - 1.0) < 1e-6,
       sum(c["weight"] for c in k_temp["contributors"]))
 check("krig 值 quality=observed", k_temp["quality"] == "observed", k_temp["quality"])
-# 降水必须自动退回 clima
-rp = D.repair_daily(1310, date="1956-01-03", method="krig", metrics=["precipitation"])
+# 降水必须自动退回 clima（用一个真正越界的降水值：4140mm 是小数点错位）
+rp = D.repair_daily(1382, date="2016-07-09", method="krig", metrics=["precipitation"])
 check("降水退回 clima（不用 krig）",
       rp["rows"][0]["method"] == "clima", rp["rows"][0]["method"])
 check("降水退回原因有说明",
       "克里金不可用" in (rp["rows"][0].get("note") or ""), rp["rows"][0].get("note", "")[:80])
+check("真越界降水 4140mm 被判 out_of_range",
+      rp["rows"][0]["problem"] == "precipitation:out_of_range", rp["rows"][0]["problem"])
+check("4140mm 修成合理暴雨量 50~250mm",
+      50 <= rp["rows"][0]["repaired"] <= 250, rp["rows"][0]["repaired"])
+# 32700 微量降水与 3xxxx 编码值是有效观测，不应被判异常
+rp2 = D.repair_daily(1382, year=2016, metrics=["precipitation"], detail_limit=50)
+check("32700/3xxxx 编码值不再被判为异常",
+      len(rp2["rows"]) == 1, len(rp2["rows"]))
 # 变差函数拟合：相关半径应为正、块金≥0
 hh = D._exp_variogram(
     D.np.array([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [3.0, 6.0, 9.0], [4.0, 8.0, 12.0]]),
@@ -355,12 +364,14 @@ win = D.daily(1266, start="2000-02-26", end="2000-03-02")
 check("闰日：区间逐日各 1 行", len(win) == 6, len(win))
 check("闰日：区间日期不重复", win["date"].nunique() == len(win), win["date"].tolist())
 
-# 气候基准改为逐指标独立过滤（原先走 weather_hist_ok 的 7 指标 AND，会连坐丢 ~9% 样本）
+# 气候基准改为逐指标独立过滤（原先走 weather_hist_ok 的 7 指标 AND，会连坐丢样本）
+# 注：v0.15 起 weather_ok 的降水判据改为「解码后判有效」，32700/3xxxx 不再整行丢弃，
+# 所以 AND 连坐比例从 21% 降到 ~5%，但仍明显存在 —— 逐指标独立过滤依然必要。
 n_and = int(D._df("SELECT count(*) n FROM weather_hist_ok WHERE station_id = 1791").iloc[0]["n"])
 n_ind = int(D._df("SELECT count(*) n FROM weather_hist WHERE station_id = 1791 "
                   "AND avg_temperature BETWEEN -100 AND 100").iloc[0]["n"])
 check("base：单指标样本多于 7 指标 AND", n_ind > n_and, (n_ind, n_and))
-check("base：连坐丢弃比例 5%~40%", 0.05 < (n_ind - n_and) / float(n_ind) < 0.40,
+check("base：连坐丢弃比例 2%~40%", 0.02 < (n_ind - n_and) / float(n_ind) < 0.40,
       round((n_ind - n_and) * 100.0 / n_ind, 2))
 
 # avg_humidity 源列是 BIGINT，修复值必须为整数（否则回写被截断）
@@ -408,7 +419,8 @@ check("退回时说明门控原因", len(t2) == 1 and "门控" in (t2[0].get("no
 check("退回后仍修出合理值", len(t2) == 1 and -50 <= t2[0]["repaired"] <= 0,
       t2[0]["repaired"] if t2 else "")
 # 降水永不走 own6（间断非高斯变量，岭回归外推爆炸）
-rp = D.repair_daily(1310, date="1956-01-03", method="own6")
+# v0.15 起 31008 这类编码值已是有效观测，换成真正越界的 4140mm 作样本
+rp = D.repair_daily(1382, date="2016-07-09", method="own6")
 pr = [r for r in rp["rows"] if r["metric"] == "precipitation"]
 check("降水 own6 一律退回 clima", len(pr) == 1 and pr[0]["method"] == "clima",
       pr[0]["method"] if pr else "")

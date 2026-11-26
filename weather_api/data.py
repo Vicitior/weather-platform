@@ -87,7 +87,18 @@ def _con():
           AND max_temperature BETWEEN -100 AND 100
           AND min_temperature BETWEEN -100 AND 100
           AND avg_humidity    BETWEEN 0 AND 100
-          AND precipitation   BETWEEN 0 AND 1000
+          -- 降水必须先解码再判有效：32700（微量）与 3xxxx（雨/雪/露霜编码）
+          -- 都是有效观测，早期直接 BETWEEN 0 AND 1000 会把它们当哨兵值，
+          -- 从而整行丢弃 2,302,000 行（13.57%）。解码口径见 decode_precipitation。
+          AND (CASE
+                 WHEN precipitation IS NULL THEN NULL
+                 WHEN precipitation IN (32766, 999990, 999998, 999999) THEN NULL
+                 WHEN precipitation = 32700 THEN 0.05
+                 WHEN precipitation >= 30000 AND precipitation < 32700
+                      THEN (precipitation % 1000) / 10.0
+                 WHEN precipitation >= 0 AND precipitation <= 1000 THEN precipitation
+                 ELSE NULL
+               END) IS NOT NULL
           AND avg_wind_speed  BETWEEN 0 AND 200
           AND sunshine_hours  BETWEEN 0 AND 24
     """)
@@ -104,6 +115,18 @@ def _con():
                         (%s) AS province_norm, province AS province_raw,
                         station_name, latitude, longitude, altitude
                  FROM read_parquet('%s/weather_station_info.parquet')""" % (PROVINCE_NORM_SQL, MY_DIR))
+    # 降水解码宏：源库降水列混用「普通量 / 32700 微量码 / 3xxxx 类型+量」三种写法，
+    # 所有聚合都必须走 prcp_mm() 换算成 mm，否则 13.57% 的行会被当哨兵值排除。
+    c.execute("""
+        CREATE OR REPLACE MACRO prcp_mm(x) AS (CASE
+            WHEN x IS NULL THEN NULL
+            WHEN x IN (32766, 999990, 999998, 999999) THEN NULL
+            WHEN x = 32700 THEN 0.05
+            WHEN x >= 30000 AND x < 32700 THEN (x % 1000) / 10.0
+            WHEN x >= 0 AND x <= 1000 THEN x
+            ELSE NULL
+        END)
+    """)
     _CACHE["c"] = c
     return c
 
@@ -300,7 +323,7 @@ def annual(station_id=None, province=None, year_from=None, year_to=None, limit=1
                round(avg(w.avg_temperature), 2) AS temp_avg,
                round(max(w.max_temperature), 1) AS temp_max,
                round(min(w.min_temperature), 1) AS temp_min,
-               round(sum(w.precipitation), 1) AS prcp_total,
+               round(sum(prcp_mm(w.precipitation)), 1) AS prcp_total,
                round(avg(w.avg_humidity), 1) AS hum_avg,
                round(sum(w.sunshine_hours), 1) AS sun_total,
                count(*) AS station_days
@@ -350,7 +373,7 @@ def monthly_climate(station_id, period_from=1991, period_to=2020):
     return _df("""
         SELECT month(w.ts_true) AS month,
                round(avg(w.avg_temperature), 1) AS temp_c,
-               round(avg(w.precipitation), 1) AS prcp_mm,
+               round(avg(prcp_mm(w.precipitation)), 1) AS prcp_mm,
                round(avg(w.avg_humidity), 0) AS hum_pct,
                round(avg(w.avg_wind_speed), 1) AS wind_ms,
                round(avg(w.sunshine_hours), 1) AS sun_h,
@@ -405,7 +428,7 @@ def compare_station_years(station_id, month_from=1, month_to=12,
         return """
         SELECT month(w.ts_true) AS month, '%s' AS period,
                round(avg(w.avg_temperature), 2) AS temp_c,
-               round(sum(w.precipitation)/count(DISTINCT year(w.ts_true)), 1) AS prcp_mm,
+               round(sum(prcp_mm(w.precipitation))/count(DISTINCT year(w.ts_true)), 1) AS prcp_mm,
                round(avg(w.max_temperature), 1) AS tmax_c,
                round(avg(w.min_temperature), 1) AS tmin_c,
                count(*) AS days
@@ -687,7 +710,7 @@ def report_table(station_id, year_from=1991, year_to=2020):
                max(w.max_temperature) AS tmax, min(w.min_temperature) AS tmin,
                avg(w.avg_temperature) AS tavg, avg(w.avg_humidity) AS rh,
                avg(w.avg_wind_speed) AS wind, avg(w.sunshine_hours) AS sun,
-               sum(w.precipitation) AS prcp_total
+               sum(prcp_mm(w.precipitation)) AS prcp_total
         FROM weather_hist_ok w
         WHERE w.station_id = %d AND year(w.ts_true) BETWEEN %d AND %d
         GROUP BY 1 ORDER BY 1
@@ -815,6 +838,13 @@ _ROUND = {"avg_temperature": 1, "max_temperature": 1, "min_temperature": 1,
 # 32xxx 均量仅 0.16mm、秋季峰、均温 13℃（正是露/霜）；且解码后与邻站降水的相关系数
 # 达 0.705（30xxx）/ 0.814（31xxx），若是现象码不可能有这种量级相关。
 # 反证：若把 32700 按 3+2+700 解成 70.0mm，新乡年均降水会从 585mm 变成 3,034mm。
+#
+# ⚠ 重要：这套解码必须同时用在「有效性判断」上。早期 weather_ok 视图用
+#   `precipitation BETWEEN 0 AND 1000` 一刀切，会把 32700（1,923,044 行）
+#   与 3xxxx（369,966 行）判为无效并把【整行】丢弃 —— 全库 16,966,797 行里
+#   2,302,000 行（13.57%）因此从概览/排行/聚合里消失，而这些行的其余 6 个
+#   指标其实是好的。修复办法见 PRCP_SQL / PRCP_VALID_SQL：把编码换算成 mm
+#   再做范围判断，只有真缺测（32766/999990/999998/999999）才判无效。
 PRECIP_SENTINELS = (32766.0, 999990.0, 999998.0, 999999.0)
 PRECIP_TYPE = {30: "雨", 31: "雪", 32: "露/霜"}
 PRECIP_MICRO = 32700.0          # 微量降水专用码，按 0.05mm 计
@@ -845,6 +875,33 @@ def decode_precipitation(v):
     if 0.0 <= fv <= 1000.0:
         return fv, None
     return None, "超出合理范围（%g）" % fv
+
+
+# SQL 版解码（逐行等价于 decode_precipitation，供视图与聚合使用）。
+# 只用 CASE + 算术，duckdb 可向量化，性能与直接读列同量级。
+#   32766/999990/999998/999999 → NULL（真缺测）
+#   32700                      → 0.05（微量降水，<0.1mm）
+#   30000~32699                → (值 % 1000) / 10.0（3+类型+降水量×0.1mm）
+#   0~1000                     → 原值
+#   其它                        → NULL（超出可解码范围，按无效处理）
+PRCP_SQL = """(CASE
+    WHEN {c} IS NULL THEN NULL
+    WHEN {c} IN (32766, 999990, 999998, 999999) THEN NULL
+    WHEN {c} = 32700 THEN 0.05
+    WHEN {c} >= 30000 AND {c} < 32700 THEN ({c} % 1000) / 10.0
+    WHEN {c} >= 0 AND {c} <= 1000 THEN {c}
+    ELSE NULL
+  END)"""
+
+
+def prcp_sql(col="precipitation"):
+    """返回把源库降水列解码成 mm 的 SQL 表达式（NULL = 缺测/无法解码）。"""
+    return PRCP_SQL.format(c=col)
+
+
+def prcp_valid_sql(col="precipitation"):
+    """返回「该降水值可用」的 SQL 布尔表达式（有编码值的行不再被判无效）。"""
+    return "%s IS NOT NULL" % prcp_sql(col)
 
 
 # 温度三列的源库缺测占位：这些不是观测值，不参与「谁把温度关系搞乱」的推理。
@@ -1140,17 +1197,31 @@ def _clamp_round(v, m):
 
 
 def _resolve_range(date=None, start=None, end=None, year=None):
-    """把 date/start/end/year 解析成具体日期区间 [d1, d2]。"""
+    """把 date/start/end/year 解析成具体日期区间 [d1, d2]。
+
+    优先级：date > start/end > year。
+    早期版本把 year 放在 start/end 之前，导致「同时传 year 与 start/end」时
+    year 静默覆盖区间（实测 _resolve_range(None,'2013-10-01','2013-10-05',2013)
+    返回整年）。现在区间参数优先，且 year 与 start/end 同时给时会校验一致性。
+    """
     if date:
-        d1 = d2 = str(date)[:10]
-    elif year:
-        d1, d2 = "%d-01-01" % int(year), "%d-12-31" % int(year)
-    elif start or end:
+        return str(date)[:10], str(date)[:10]
+    if start or end:
         d1 = str(start)[:10] if start else "1951-01-01"
         d2 = str(end)[:10] if end else "2025-12-31"
-    else:
-        raise ValueError("请指定 date 或 start/end 或 year")
-    return d1, d2
+        if year:
+            y = int(year)
+            inside = d1 >= "%d-01-01" % y and d2 <= "%d-12-31" % y
+            if inside:
+                # year 只是重复约束，忽略即可
+                pass
+            else:
+                raise ValueError(
+                    "year=%d 与 start/end=%s~%s 冲突，请只给其中一种" % (y, d1, d2))
+        return d1, d2
+    if year:
+        return "%d-01-01" % int(year), "%d-12-31" % int(year)
+    raise ValueError("请指定 date 或 start/end 或 year")
 
 
 def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_limit=500):
@@ -1168,7 +1239,14 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
     aggs = []
     for m, (lo, hi) in PHYS_RANGE.items():
         aggs.append("count(t.%s) AS %s__have" % (m, m))
-        aggs.append("count(*) FILTER (WHERE t.%s BETWEEN %f AND %f) AS %s__valid" % (m, lo, hi, m))
+        if m == "precipitation":
+            # 降水先解码再判有效：32700（微量）与 3xxxx（雨/雪/露霜编码）都是有效观测，
+            # 按原始值判 BETWEEN 0 AND 1000 会把它们误报成 out_of_range 并去「修复」。
+            aggs.append("count(*) FILTER (WHERE prcp_mm(t.precipitation) BETWEEN %f AND %f)"
+                        " AS %s__valid" % (lo, hi, m))
+        else:
+            aggs.append("count(*) FILTER (WHERE t.%s BETWEEN %f AND %f) AS %s__valid"
+                        % (m, lo, hi, m))
     s = _df("""
         WITH cal AS (SELECT unnest(generate_series(DATE '%s', DATE '%s', INTERVAL 1 DAY))::DATE AS date),
              t AS (SELECT %s AS date, * FROM weather_hist WHERE %s)
@@ -1213,8 +1291,11 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
                     OR t.avg_temperature - t.min_temperature < -5))
         ORDER BY cal.date LIMIT %d
     """ % (d1, d2, dc, cond,
-           " OR ".join("(t.%s IS NULL OR t.%s NOT BETWEEN %f AND %f)" % (m, m, lo, hi)
-                       for m, (lo, hi) in PHYS_RANGE.items()),
+           " OR ".join(
+               ("(prcp_mm(t.precipitation) IS NULL OR prcp_mm(t.precipitation) NOT BETWEEN %f AND %f)"
+                % (lo, hi)) if m == "precipitation"
+               else "(t.%s IS NULL OR t.%s NOT BETWEEN %f AND %f)" % (m, m, lo, hi)
+               for m, (lo, hi) in PHYS_RANGE.items()),
            int(detail_limit)))
     rows = []
     for _, r in detail.iterrows():
@@ -1226,6 +1307,14 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
             for m, (lo, hi) in PHYS_RANGE.items():
                 if vals[m] is None:
                     problems.append(m + ":missing")
+                elif m == "precipitation":
+                    # 降水原始值是编码：32700/3xxxx 解码后才是有效数值，
+                    # 只有解码后仍越界（或无法解码）才算 out_of_range。
+                    dec, _why = decode_precipitation(vals[m])
+                    if dec is None:
+                        problems.append(m + ":out_of_range")
+                    elif dec < lo or dec > hi:
+                        problems.append(m + ":out_of_range")
                 elif vals[m] < lo or vals[m] > hi:
                     problems.append(m + ":out_of_range")
             # 温度三列内部一致性（物理约束 min ≤ avg ≤ max，不依赖历史统计）
@@ -1619,11 +1708,15 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
                "avg_wind_speed": "avg_wind_speed", "sunshine_hours": "sunshine_hours"}
         parts = []
         for m, (lo, hi) in PHYS_RANGE.items():
-            f = "FILTER (WHERE %s BETWEEN %f AND %f)" % (m, lo, hi)
             if m == "precipitation":
-                parts.append("sum(precipitation) %s / NULLIF(count(DISTINCT year(ts_true)) %s, 0)"
+                # 降水先解码再过滤：32700/3xxxx 解码成 mm 后才是可比数值
+                f = ("FILTER (WHERE prcp_mm(precipitation) BETWEEN %f AND %f)"
+                     % (lo, hi))
+                parts.append("sum(prcp_mm(precipitation)) %s"
+                             " / NULLIF(count(DISTINCT year(ts_true)) %s, 0)"
                              " AS precipitation" % (f, f))
             else:
+                f = "FILTER (WHERE %s BETWEEN %f AND %f)" % (m, lo, hi)
                 parts.append("avg(%s) %s AS %s" % (cal[m], f, m))
         b = _df("""
             SELECT station_id, month(ts_true) AS month, %s
@@ -2231,6 +2324,28 @@ def repair_daily(station_id, date=None, start=None, end=None, year=None,
                         "只能退回本站时间维/气候基准，请谨慎采信" % float(radius_km))
     elif n_repaired == 0:
         warnings.append("%d 个邻站当日与前后日均无有效观测，本次未修出任何值" % len(nmeta))
+    # 整站停更提示：区间内后半段完全没有记录时，停更段保护会拒绝用气候态填充，
+    # 用户会看到「大量值修不出来」却不知道为什么 —— 必须明确告诉他数据止于哪天。
+    if bad:
+        gaps = [b[0] for b in bad]
+        last_bad = max(gaps)
+        try:
+            _cov = _df("""
+                SELECT max(t.ts_true)::VARCHAR AS last_ts
+                FROM weather_hist t WHERE t.station_id = %d
+                  AND t.date_true BETWEEN DATE '%s' AND DATE '%s'
+            """ % (sid, d1, d2))
+            last_ts = _cov.iloc[0]["last_ts"] if not _cov.empty else None
+        except Exception:
+            last_ts = None
+        if last_ts:
+            last_day = str(last_ts)[:10]
+            if last_day < last_bad:
+                warnings.append(
+                    "该站在区间内最后一条记录是 %s，之后到 %s 完全停更（%d 天无任何记录）；"
+                    "停更段默认不填气候态，所以这部分值会显示为无法修复。"
+                    "如需强制填充，把 max_gap_days 调大（但填出来的是气候态不是实况）。"
+                    % (last_day, last_bad, len([d for d in gaps if d > last_day])))
     return {
         "station": {"station_id": sid, "station_code": info.get("station_code"),
                     "station_name": info.get("station_name"), "province": info.get("province"),
