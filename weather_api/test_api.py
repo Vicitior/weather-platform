@@ -507,5 +507,32 @@ if cs["stations"]:
 cs2 = D.column_swap_scan(station_id=1382)
 check("正常站不被误判为列互换", cs2["summary"]["found"] == 0, cs2["summary"])
 
+print("== 29. v0.13 日较差判据（温度三列合理性）==")
+# 29.1 日较差 avg-min > 25 被识别
+check("日较差 >25 被识别", any(x.startswith("avg-min>25") for x in D._temp_consistency(
+    {"max_temperature": 10.0, "avg_temperature": 30.0, "min_temperature": 1.0})), "")
+check("日较差 < -5 被识别", any(x.startswith("avg-min<-5") for x in D._temp_consistency(
+    {"max_temperature": 10.0, "avg_temperature": 1.0, "min_temperature": 8.0})), "")
+check("正常日较差（5℃）不报", D._temp_consistency(
+    {"max_temperature": 16.0, "avg_temperature": 9.0, "min_temperature": 4.0}) == [], "")
+# 29.2 repair_scan 能抓到 2021 年新乡的范围内真错误
+sc21 = D.repair_scan(1382, year=2021, detail_limit=100)
+check("2021 年抓到日较差异常（3 条）", sc21["summary"]["inconsistent_spread"] >= 3,
+      sc21["summary"]["inconsistent_spread"])
+check("summary 含 inconsistent_spread 字段", "inconsistent_spread" in sc21["summary"],
+      list(sc21["summary"]))
+spread_days = [b["date"][:10] for b in sc21["bad_rows"]
+               if any("avg-min>25" in p for p in b["problems"])]
+check("2021-01-16 被日较差判据抓到", "2021-01-16" in spread_days, spread_days[:5])
+check("2021-07-27 被日较差判据抓到", "2021-07-27" in spread_days, spread_days[:5])
+# 29.3 1610 站列互换也大面积触发日较差
+sc1610b = D.repair_scan(1610, year=2019, detail_limit=5)
+check("1610 站日较差异常 >100 条", sc1610b["summary"]["inconsistent_spread"] > 100,
+      sc1610b["summary"]["inconsistent_spread"])
+# 29.4 正常年份不误报
+sc19 = D.repair_scan(1382, year=2019, detail_limit=5)
+check("2019 年正常不误报日较差", sc19["summary"]["inconsistent_spread"] == 0,
+      sc19["summary"]["inconsistent_spread"])
+
 print("\n===== %d passed, %d failed =====" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

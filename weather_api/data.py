@@ -870,6 +870,14 @@ def _temp_consistency(vals):
       max<avg  11 行、avg<min 1,660 行、max<min  8 行，合计 1,671 行。
     其中 avg<min 的 1,660 行里有 1,640 行集中在站点 1610（列互换），
     旧版 repair_scan 只检查 max<min（8 行），漏掉了 99.5% 的自洽性错误。
+
+    另加「日较差」约束：avg − min 正常在 0~25℃ 之间（日最高与最低的差的一半左右）。
+    avg − min > 25 意味着平均气温比当日最低温高了 25℃ 以上，不可能（一天之中
+    ≥一半时间接近日最低，均值不可能被拉到远高于它）；avg − min < −5 意味着
+    平均气温低于当日最低温，直接违反 min ≤ avg。
+    2026-11-26 全库扫描（剔除哨兵值后）：共 1,154 行命中，其中 1,132 行集中在
+    1610 站（列互换），其余散在 9 站共 22 行 —— 都是真错误（如新乡 2021 年
+    avg=47/49/50 而当日 min≈0℃，实为 avg 与 avg_humidity 两列对调）。
     """
     out = []
     mx, av, mn = vals.get("max_temperature"), vals.get("avg_temperature"), vals.get("min_temperature")
@@ -879,6 +887,12 @@ def _temp_consistency(vals):
         out.append("max<avg")
     if av is not None and mn is not None and av < mn:
         out.append("avg<min")
+    if av is not None and mn is not None:
+        sp = av - mn
+        if sp > 25.0:
+            out.append("avg-min>25（日较差不可能）")
+        elif sp < -5.0:
+            out.append("avg-min<-5（均值远低于日最低）")
     return out
 
 
@@ -1021,7 +1035,11 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
                count(*) FILTER (WHERE t.max_temperature IS NOT NULL AND t.avg_temperature IS NOT NULL
                                 AND t.max_temperature < t.avg_temperature) AS inconsistent_maxavg,
                count(*) FILTER (WHERE t.avg_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
-                                AND t.avg_temperature < t.min_temperature) AS inconsistent_avgmin
+                                AND t.avg_temperature < t.min_temperature) AS inconsistent_avgmin,
+               count(*) FILTER (WHERE t.avg_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
+                                AND t.avg_temperature BETWEEN -60 AND 55 AND t.min_temperature BETWEEN -65 AND 45
+                                AND (t.avg_temperature - t.min_temperature > 25
+                                     OR t.avg_temperature - t.min_temperature < -5)) AS inconsistent_spread
         FROM cal LEFT JOIN t ON cal.date = t.date
     """ % (d1, d2, dc, cond, ", ".join(aggs))).iloc[0].to_dict()
 
@@ -1046,6 +1064,10 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
                AND t.max_temperature < t.avg_temperature)
            OR (t.avg_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
                AND t.avg_temperature < t.min_temperature)
+           OR (t.avg_temperature IS NOT NULL AND t.min_temperature IS NOT NULL
+               AND t.avg_temperature BETWEEN -60 AND 55 AND t.min_temperature BETWEEN -65 AND 45
+               AND (t.avg_temperature - t.min_temperature > 25
+                    OR t.avg_temperature - t.min_temperature < -5))
         ORDER BY cal.date LIMIT %d
     """ % (d1, d2, dc, cond,
            " OR ".join("(t.%s IS NULL OR t.%s NOT BETWEEN %f AND %f)" % (m, m, lo, hi)
@@ -1080,6 +1102,7 @@ def repair_scan(station_id, date=None, start=None, end=None, year=None, detail_l
                     "inconsistent_maxmin": int(s["inconsistent_maxmin"]),
                     "inconsistent_maxavg": int(s["inconsistent_maxavg"]),
                     "inconsistent_avgmin": int(s["inconsistent_avgmin"]),
+                    "inconsistent_spread": int(s["inconsistent_spread"]),
                     "inconsistent_total": int(s["inconsistent_maxmin"]) + int(s["inconsistent_maxavg"])
                                           + int(s["inconsistent_avgmin"]),
                     "per_metric": per_metric},
