@@ -3,9 +3,10 @@
 把一套**气象站点时序数据**（876 站 × 1951–2025 逐日 × 7 个要素，约 1700 万行）从云端数据库
 镜像到本地、做质量体检、识别并修复异常/缺测，并对外提供一套完整的中文气象查询 HTTP API。
 
-> 数据来源为第三方云数据库（TDengine Cloud + MySQL RDS）。本仓库的 git 历史里**不含数据、不含任何凭据**。
-> 想立刻跑起来：直接下 [Release 里的数据包](https://github.com/Vicitior/weather-platform/releases)（367 MB，
-> 解压即用）；想自己从源库镜像：用 `mirror_dbs.py`。
+> 数据来源为第三方云数据库。本仓库的 git 历史里**不含数据、不含任何凭据**。
+> **只想调用接口（不用碰数据）**：把服务端部署好后，直接把 [`weather_api/API对接文档.md`](weather_api/API对接文档.md) 给调用方即可——
+> 数据留在服务端，调用方只需 HTTP 请求，不需要数据文件、也不需要数据库账号。
+> **要自己搭一套**：仓库只有代码，367 MB 的数据包在 [Release v1.0.0](https://github.com/Vicitior/weather-platform/releases/tag/v1.0.0) 附件里，解压即用。
 
 ---
 
@@ -32,7 +33,8 @@ weather-platform/
 │   ├── export.py                 # 填报表导出 Word / Excel
 │   ├── test_api.py               # 155 项自检
 │   ├── requirements.txt
-│   ├── README.md                 # 接口文档
+│   ├── README.md                 # 接口文档（开发者速查）
+│   ├── API对接文档.md             # 给调用方的完整接口文档（32 个路由逐个说明）
 │   └── DEPLOY.md                 # 部署到服务器的步骤
 │
 ├── 数据获取
@@ -74,6 +76,38 @@ weather-platform/
 ---
 
 ## 快速开始
+
+> **三种用法，先选一条：**
+>
+> - **只调用接口、不碰数据（给别人用时最常用）** → 你在服务器上把服务起好（下方「快速上手」），
+>   然后把 [`weather_api/API对接文档.md`](weather_api/API对接文档.md) 发给调用方即可。
+>   调用方只发 HTTP 请求，不需要数据文件、不需要数据库账号。
+> - **自己用现成数据搭一套** → 按「快速上手」三步：下载 Release 数据包 → 解压 → 起 API。
+> - **想从源库重新镜像** → 走后面的第 2、3 步（需要你自己的数据库凭据）。
+>
+> **数据不在 git 仓库里**（392 MB），`git clone` 只会得到代码。要自己跑服务，
+> 必须同时拿到 [Release v1.0.0 的数据包](https://github.com/Vicitior/weather-platform/releases/tag/v1.0.0)。
+
+### 快速上手：用现成数据（3 步）
+
+```bash
+# 1. 下载代码 + 数据包
+git clone https://github.com/Vicitior/weather-platform.git
+cd weather-platform
+curl -LO https://github.com/Vicitior/weather-platform/releases/download/v1.0.0/weather-platform-db_mirror.tar.gz
+
+# 2. 解压（解压后得到 db_mirror/ 目录，与 weather_api/ 同级）
+tar -xzf weather-platform-db_mirror.tar.gz
+
+# 3. 装依赖、起服务
+pip install -r weather_api/requirements.txt
+python -m weather_api.main          # 默认 0.0.0.0:8900
+```
+
+打开 `http://127.0.0.1:8900/docs` 看接口，或 `GET /api/health` 确认健康。
+自检：`python weather_api/test_api.py`（155 项，几秒跑完）。
+
+### 下面是从源库镜像的步骤（只有重新拉数据才需要）
 
 ### 1. 装依赖
 

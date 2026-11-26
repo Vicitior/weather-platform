@@ -563,6 +563,7 @@ def api_repair_batches(limit: int = Query(200, ge=1, le=2000, description="返�
 def api_repair_batch(
     station_ids: str = Query(None, description="逗号分隔的站点 ID（与 province 二选一，都不给=全库）"),
     province: str = Query(None, description="省份（如 黑龙江），批量补齐该省所有站"),
+    date: str = Query(None, description="单日 YYYY-MM-DD（等价于 start=end=date）"),
     start: str = Query(None, description="起始日 YYYY-MM-DD"),
     end: str = Query(None, description="结束日"),
     year: int = Query(None, description="整年"),
@@ -585,6 +586,9 @@ def api_repair_batch(
     记入 failed[]。"""
     ids = [s.strip() for s in station_ids.split(",") if s.strip()] if station_ids else None
     ms = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else None
+    # date 是单日简写，转成 start/end 传给底层（底层 repair_batch 只认 start/end/year）
+    if date:
+        start = end = date
     try:
         return ok(D.repair_batch(station_ids=ids, province=province,
                                  start=start, end=end, year=year, metrics=ms,
